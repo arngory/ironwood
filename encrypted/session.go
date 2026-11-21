@@ -479,6 +479,11 @@ func (info *sessionInfo) doRecv(from phony.Actor, msg []byte) {
 		var header [32]byte
 		ad := header[:copy(header[:], orig[:offset])]
 		msg := msg[offset:]
+		// The size check above counts a byte a varint, and Uvarint takes up to 10: the sealed part must still hold
+		// the sender's next key, or opening it would slice that key out of less (a panic in this actor)
+		if len(msg) < boxOverhead+boxPubSize {
+			return
+		}
 		fromCurrent := remoteKeySeq == info.remoteKeySeq
 		fromNext := remoteKeySeq == info.remoteKeySeq+1
 		toRecv := localKeySeq+1 == info.localKeySeq

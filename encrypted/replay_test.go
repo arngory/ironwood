@@ -237,3 +237,25 @@ func TestRatchetStepKeepsMark(t *testing.T) {
 		t.Fatal("a fresh window after a new session is not fresh")
 	}
 }
+
+// TestReinitKeepsReplay (R4-5): a peer's init that makes our next-send key the receive key keeps the mark of the
+// packets taken under it. Upstream started it afresh: a re-init of the peer's with its current keys opened again what
+// it had sent under them
+func TestReinitKeepsReplay(t *testing.T) {
+	var ed edPub
+	cur, _ := newBoxKeys()
+	next, _ := newBoxKeys()
+	info := newSession(&ed, cur, next, 1)
+	info.nextSendNonce = 37 // the peer's packets taken under the next key
+	newNext, _ := newBoxKeys()
+	init := newSessionInit(&next, &newNext, 2)
+	info._handleUpdate(&init)
+	for n := uint64(0); n <= 37; n++ {
+		if info.recvWindow.check(n) {
+			t.Fatalf("nonce %d, taken under the next key before the init, open again", n)
+		}
+	}
+	if !info.recvWindow.check(38) {
+		t.Fatal("a nonce after the mark rejected")
+	}
+}

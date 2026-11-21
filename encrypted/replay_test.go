@@ -170,3 +170,70 @@ func TestReplayWindowAgainstModel(t *testing.T) {
 		}
 	}
 }
+
+// TestReplayWindowResetAt: after resetAt(floor) every nonce up to floor is taken for seen, as under a strict mark, and
+// every nonce above it is taken once, in any order.
+func TestReplayWindowResetAt(t *testing.T) {
+	rng := rand.New(rand.NewSource(3))
+	for _, floor := range []uint64{1, 62, 63, 64, 65, 127, 128, 1000, replayWindowDepth + 7, 1<<20 + 5} {
+		var w replayWindow
+		w.reset()
+		for n := uint64(1); n < 50; n++ {
+			w.commit(n) // some state before, as a session has
+		}
+		w.resetAt(floor)
+		low := uint64(0)
+		if floor > replayWindowDepth+5 {
+			low = floor - replayWindowDepth - 5
+		}
+		for n := low; n <= floor; n++ {
+			if w.check(n) {
+				t.Fatalf("floor %d: nonce %d at or below it taken", floor, n)
+			}
+		}
+		perm := rng.Perm(300)
+		for _, i := range perm {
+			n := floor + 1 + uint64(i)
+			if !w.check(n) {
+				t.Fatalf("floor %d: nonce %d above it rejected", floor, n)
+			}
+			w.commit(n)
+		}
+		for _, i := range perm {
+			if n := floor + 1 + uint64(i); w.check(n) {
+				t.Fatalf("floor %d: nonce %d taken twice", floor, n)
+			}
+		}
+		for n := low; n <= floor; n++ {
+			if w.check(n) {
+				t.Fatalf("floor %d: nonce %d at or below it taken after the window moved", floor, n)
+			}
+		}
+	}
+}
+
+// TestRatchetStepKeepsMark: a ratchet step (_fixShared with the next key's mark) leaves every nonce up to it refused
+// under the new receive key: packets taken under it while it was the next key do not open again. The window from
+// 6599008 kept only the step's own nonce, and the rest of the minute before the step opened twice.
+func TestRatchetStepKeepsMark(t *testing.T) {
+	var ed edPub
+	cur, _ := newBoxKeys()
+	next, _ := newBoxKeys()
+	info := newSession(&ed, cur, next, 1)
+	for n := uint64(1); n <= 20; n++ {
+		info.recvWindow.commit(n)
+	}
+	info._fixShared(5000, 0)
+	for n := uint64(0); n <= 5000; n++ {
+		if info.recvWindow.check(n) {
+			t.Fatalf("nonce %d, at or below the step's 5000, taken after the step", n)
+		}
+	}
+	if !info.recvWindow.check(5001) || !info.recvWindow.check(5002) {
+		t.Fatal("a nonce after the step's rejected")
+	}
+	info._fixShared(0, 0) // a new session (init, ack): a fresh window
+	if info.recvWindow.check(0) || !info.recvWindow.check(1) {
+		t.Fatal("a fresh window after a new session is not fresh")
+	}
+}

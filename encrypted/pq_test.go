@@ -168,6 +168,7 @@ var pqOn = PQConfig{Enabled: true}
 // TestPQBetweenTwoNodes: both with PQ sessions: the first packet goes at once (classic), the PQ session takes the
 // classic one's place, traffic goes on (type 0x13 only, from then on), and each end holds the other as sticky.
 func TestPQBetweenTwoNodes(t *testing.T) {
+	t.Parallel()
 	a, b := newPQNode(t, pqOn), newPQNode(t, pqOn)
 	linkPQ(t, a, b)
 	if !hears(a, b, "hello", 3*time.Second) {
@@ -194,6 +195,7 @@ func TestPQBetweenTwoNodes(t *testing.T) {
 // TestPQWithClassicNode: a node without PQ sessions (off here; the same as one without them) gets classic at once,
 // and the key is not sticky.
 func TestPQWithClassicNode(t *testing.T) {
+	t.Parallel()
 	a, b := newPQNode(t, pqOn), newPQNode(t, PQConfig{})
 	linkPQ(t, a, b)
 	if !hears(a, b, "hello", 2*time.Second) || !hears(b, a, "back", 2*time.Second) {
@@ -214,6 +216,7 @@ func TestPQWithClassicNode(t *testing.T) {
 // TestPQDowngradeRequired: a link that drops the PQ types. A key that must be PQ gets no session at all, not a
 // classic one.
 func TestPQDowngradeRequired(t *testing.T) {
+	t.Parallel()
 	var b *pqNode
 	a := newPQNode(t, PQConfig{Enabled: true, Required: func(k ed25519.PublicKey) bool { return bytes.Equal(k, b.pub) }})
 	b = newPQNode(t, pqOn)
@@ -242,6 +245,7 @@ func TestPQDowngradeRequired(t *testing.T) {
 
 // TestPQDowngradePossible: the same link, keys "where possible": classic, and not sticky.
 func TestPQDowngradePossible(t *testing.T) {
+	t.Parallel()
 	a, b := newPQNode(t, pqOn), newPQNode(t, pqOn)
 	a.dropPQ.Store(true)
 	b.dropPQ.Store(true)
@@ -256,6 +260,7 @@ func TestPQDowngradePossible(t *testing.T) {
 
 // TestPQStickyRefusesClassic: after a PQ session, losing the PQ packets does not bring classic back.
 func TestPQStickyRefusesClassic(t *testing.T) {
+	t.Parallel()
 	a, b := newPQNode(t, pqOn), newPQNode(t, pqOn)
 	linkPQ(t, a, b)
 	if !hears(a, b, "hello", 3*time.Second) {
@@ -278,6 +283,7 @@ func TestPQStickyRefusesClassic(t *testing.T) {
 
 // TestPQRequiredBothWays: a key that must be PQ, PQ packets carried: a PQ session from the start, no classic packet.
 func TestPQRequiredBothWays(t *testing.T) {
+	t.Parallel()
 	var a, b *pqNode
 	a = newPQNode(t, PQConfig{Enabled: true, Required: func(k ed25519.PublicKey) bool { return bytes.Equal(k, b.pub) }})
 	b = newPQNode(t, PQConfig{Enabled: true, Required: func(k ed25519.PublicKey) bool { return bytes.Equal(k, a.pub) }})

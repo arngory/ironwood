@@ -343,7 +343,7 @@ func TestPQClassicRestored(t *testing.T) {
 				t.Fatalf("PQ sessions counted: %d, want %d", got, want)
 			}
 			switch c.name {
-			case "probe rollback", "evicted":
+			case "timer", "probe rollback", "evicted":
 				if !retry {
 					t.Fatal("no upgrade tried again later")
 				}
@@ -486,46 +486,74 @@ func TestPQEmptyMessage(t *testing.T) {
  * R2B-3 *
  *********/
 
-// R2B-3: a key is held to PQ until the end of its newest ML-KEM key seen here (no slack); a newer key of it accepted
-// moves the end on; an entry past its end is not sticky, and goes.
+// R2B-3, R3-1, R3-3: a key is held to PQ until the end of the ML-KEM key it is marked under and the clock slack, and
+// no more than pqKeyValidity from the mark; a newer key of it accepted moves the end on, a newer key in the table
+// does not move a mark under an older one; an entry past its end is not sticky, and goes.
 func TestPQStickyExpiry(t *testing.T) {
 	pc := newBarePC(t)
 	start := time.Now()
 	clock := start
 	pc.pq.now = func() time.Time { return clock }
 	n := uint64(start.Unix())
-	k, k2, k3 := newPeerEd(t), newPeerEd(t), newPeerEd(t)
-	pc.pq.markSticky(&k, n+100, true)
+	hour, validity, slack := uint64(3600), uint64(pqKeyValidity/time.Second), uint64(pqClockSlack/time.Second)
+	until := func(k edPub) uint64 {
+		if e := stickyFor(pc, k); e != nil {
+			return e.until
+		}
+		return 0
+	}
+	// a fresh key: held for pqKeyValidity from the mark, then not, and the entry goes
+	k := newPeerEd(t)
+	pc.pq.markSticky(&k, n+validity, true)
+	if until(k) != n+validity {
+		t.Fatalf("held until %d, want %d", until(k), n+validity)
+	}
+	clock = start.Add(pqKeyValidity)
 	if !pc.pq.required(&k) {
-		t.Fatal("not held to PQ within its notAfter")
+		t.Fatal("not held to PQ within its hold")
 	}
-	clock = start.Add(101 * time.Second)
+	clock = start.Add(pqKeyValidity + time.Second)
 	if pc.pq.required(&k) || stickyFor(pc, k) != nil {
-		t.Fatal("held to PQ past its notAfter, or the entry stayed")
+		t.Fatal("held to PQ past its hold, or the entry stayed")
 	}
-	// out of time already when marked: not held
-	pc.pq.markSticky(&k3, n, true)
-	if pc.pq.required(&k3) {
-		t.Fatal("held to PQ with a notAfter past")
-	}
-	// a newer key of k2 accepted: held until its end
 	clock = start
-	pub1, pub2 := newPQKeyPub(t), newPQKeyPub(t)
-	pc.pq.accept(&k2, &pub1, n-10, n+100)
-	pc.pq.markSticky(&k2, 0, true) // the table's key gives the end
-	if e := stickyFor(pc, k2); e == nil || e.notAfter != n+100 {
-		t.Fatal("the end not taken from the table's key")
+	// a peer's clock a day behind: its key ended by ours, and held all the same (the clock slack)
+	behind := newPeerEd(t)
+	pc.pq.markSticky(&behind, n-24*hour, true)
+	if !pc.pq.required(&behind) || until(behind) != n+48*hour {
+		t.Fatalf("a key a day behind: held %v, until %d", pc.pq.required(&behind), until(behind))
 	}
-	if ok, upd := pc.pq.accept(&k2, &pub2, n, n+1000); !ok || !upd {
+	// out of time past the slack: not held
+	gone := newPeerEd(t)
+	pc.pq.markSticky(&gone, n-slack-1, true)
+	if pc.pq.required(&gone) {
+		t.Fatal("held to PQ with a key past its end and the slack")
+	}
+	// a key valid far ahead (an attacker's): no hold past pqKeyValidity
+	far := newPeerEd(t)
+	pc.pq.markSticky(&far, n+5*24*hour, true)
+	if until(far) != n+validity {
+		t.Fatalf("a far notAfter held until %d, want %d", until(far), n+validity)
+	}
+	// a newer key of a sticky one accepted: held for it
+	k2 := newPeerEd(t)
+	pub1, pub2 := newPQKeyPub(t), newPQKeyPub(t)
+	pc.pq.accept(&k2, &pub1, n-10, n-10+validity)
+	pc.pq.markSticky(&k2, n-10+validity, true)
+	clock = start.Add(40 * time.Hour)
+	if ok, upd := pc.pq.accept(&k2, &pub2, n+40*hour, n+40*hour+validity); !ok || !upd {
 		t.Fatal("the newer key not taken")
 	}
-	clock = start.Add(500 * time.Second)
-	if !pc.pq.required(&k2) {
-		t.Fatal("a newer key of a sticky one did not move its end on")
+	if until(k2) != n+88*hour {
+		t.Fatalf("a newer key of a sticky one: held until %d, want %d", until(k2), n+88*hour)
 	}
-	clock = start.Add(1001 * time.Second)
-	if pc.pq.required(&k2) {
-		t.Fatal("held past the end of the newer key")
+	// a newer key in the table does not move a mark under an older key (the session's)
+	clock = start
+	k3 := newPeerEd(t)
+	pc.pq.accept(&k3, &pub1, n, n+validity)
+	pc.pq.markSticky(&k3, n-60*hour, true)
+	if until(k3) != n-60*hour+slack {
+		t.Fatalf("held until %d by a newer key of the table, want %d (the session's key)", until(k3), n-60*hour+slack)
 	}
 }
 
@@ -545,9 +573,11 @@ func TestPQStickyEndsAfterOff(t *testing.T) {
 		t.Fatal("no traffic over PQ")
 	}
 	aKey, aEnd := a.key(), a.pc.pqOwn().notAfter
-	if e := stickyFor(b.pc, aKey); e == nil || e.notAfter != aEnd {
-		t.Fatalf("B's sticky entry for A: %+v, want its end at %d", e, aEnd)
+	e := stickyFor(b.pc, aKey)
+	if e == nil || e.until < aEnd || e.until > uint64(time.Now().Add(pqKeyValidity).Unix()) {
+		t.Fatalf("B's sticky entry for A: %+v, want its end from %d to now and pqKeyValidity", e, aEnd)
 	}
+	end := e.until
 	time.Sleep(1100 * time.Millisecond) // A's classic init, made after, numbered after the PQ session's
 	a.pc.SetPQ(PQConfig{})
 	if hears(a, b, "off, held", 2*time.Second) || hears(b, a, "off, held back", time.Second) {
@@ -556,7 +586,7 @@ func TestPQStickyEndsAfterOff(t *testing.T) {
 	if logB.count("a classic init from") != 1 {
 		t.Fatalf("B's log: %q", logB.all())
 	}
-	clockB.Store(int64(time.Until(time.Unix(int64(aEnd), 0)) + time.Minute))
+	clockB.Store(int64(time.Until(time.Unix(int64(end), 0)) + time.Minute))
 	if !hears(a, b, "after its end", 5*time.Second) || !hears(b, a, "after its end, back", 5*time.Second) {
 		t.Fatalf("no traffic past the end of A's key: A %s, B %s", session(a, b), session(b, a))
 	}
@@ -578,7 +608,11 @@ func TestPQStickyEndsAfterRestart(t *testing.T) {
 	waitSessions(t, a, b, "pq", 10*time.Second)
 	hears(a, b, "pq", 3*time.Second)
 	hears(b, a, "pq back", 3*time.Second)
-	aEnd := a.pc.pqOwn().notAfter
+	e := stickyFor(b.pc, a.key())
+	if e == nil {
+		t.Fatal("B does not hold A to PQ")
+	}
+	end := e.until
 	priv := a.pc.PacketConn.PrivateKey()
 	time.Sleep(1100 * time.Millisecond)
 	a.pc.Close()
@@ -587,7 +621,7 @@ func TestPQStickyEndsAfterRestart(t *testing.T) {
 	if hears(a2, b, "restarted, held", 2*time.Second) {
 		t.Fatal("classic from a key held to PQ taken")
 	}
-	clockB.Store(int64(time.Until(time.Unix(int64(aEnd), 0)) + time.Minute))
+	clockB.Store(int64(time.Until(time.Unix(int64(end), 0)) + time.Minute))
 	if !hears(a2, b, "after its end", 10*time.Second) || !hears(b, a2, "after its end, back", 5*time.Second) {
 		t.Fatalf("no traffic past the end of A's key: A %s, B %s", session(a2, b), session(b, a2))
 	}
@@ -610,8 +644,8 @@ func newPQNodeKey(t *testing.T, priv ed25519.PrivateKey, cfg PQConfig) *pqNode {
 	return n
 }
 
-// R2B-3: a classic init or classic traffic from a key held to PQ gives a line in the log, one a pqLogInterval; a
-// forged init none.
+// R2B-3: a classic init from a key held to PQ gives a line in the log, one a pqLogInterval; a forged init none, nor
+// classic traffic (no one signed it).
 func TestPQStickyAsksClassicLogged(t *testing.T) {
 	var log logSink
 	n := newPQNode(t, PQConfig{Enabled: true, Logf: log.f}) // no link
@@ -636,8 +670,12 @@ func TestPQStickyAsksClassicLogged(t *testing.T) {
 	traffic := make([]byte, sessionTrafficOverheadMin)
 	traffic[0] = sessionTypeTraffic
 	deliver(traffic)
-	if got := log.count("classic traffic from"); got != 1 {
-		t.Fatalf("classic traffic from a sticky key, once the interval passed: %d lines: %q", got, log.all())
+	if got := len(log.all()); got != 1 {
+		t.Fatalf("classic traffic no one signed logged: %q", log.all())
+	}
+	deliver(classicInitFrom(t, peer, n.pc))
+	if got := log.count("a classic init from"); got != 2 {
+		t.Fatalf("a classic init once the interval passed: %d lines in all: %q", got, log.all())
 	}
 	if n.sent[sessionTypeInit].Load()+n.sent[sessionTypeAck].Load() != 0 {
 		t.Fatal("a classic init or ack went to a key held to PQ")
@@ -725,12 +763,13 @@ func TestPQStickyRaisedByTraffic(t *testing.T) {
  * R2B-5 *
  *********/
 
-// R2B-5: PQConfig.SessionMax PQ sessions, confirmed or not, and no more for a key that may be classic (a line in the
-// log; no PQ init or PQInfo from us either); a key held to PQ gets its own. PQSessionCount tells how many are up.
+// R2B-5, R3-2: past PQConfig.SessionMax PQ sessions, this node starts none with a key that may be classic (a line in
+// the log; no PQ init or PQInfo from us either), and still takes one a peer starts. PQSessionCount tells how many
+// are up.
 func TestPQSessionMax(t *testing.T) {
 	var log logSink
 	n := newPQNode(t, PQConfig{Enabled: true, Logf: log.f, SessionMax: 1}) // no link
-	p1, p2, p3 := newBarePC(t), newBarePC(t), newBarePC(t)
+	p1, p2, p3 := lightPC(t), lightPC(t), lightPC(t)
 	k1, k2, k3 := edOf(p1), edOf(p2), edOf(p3)
 	deliver := func(k edPub, data []byte) {
 		n.pc.sessions.handleData(nil, &k, data)
@@ -741,27 +780,23 @@ func TestPQSessionMax(t *testing.T) {
 	if n.pc.PQSessionCount() != 1 || n.sent[sessionTypePQAck].Load() != 1 {
 		t.Fatalf("the first PQ init: %d PQ sessions, %d acks", n.pc.PQSessionCount(), n.sent[sessionTypePQAck].Load())
 	}
+	// past SessionMax, a PQ init of the peer's: taken
 	deliver(k2, pqInitFrom(t, p2, n.pc))
-	if n.pc.PQSessionCount() != 1 || n.sent[sessionTypePQAck].Load() != 1 || session(n, &pqNode{pub: p2.publicEd[:]}) != "none" {
-		t.Fatalf("past the most: %d PQ sessions, %d acks", n.pc.PQSessionCount(), n.sent[sessionTypePQAck].Load())
-	}
-	if log.count("the most kept (PQConfig.SessionMax)") != 1 {
-		t.Fatalf("log: %q", log.all())
-	}
-	// a classic handshake with p2, whose key is known now: classic, and nothing of PQ goes
-	before := n.sent[sessionTypePQInfo].Load() + n.sent[sessionTypePQInit].Load()
-	deliver(k2, classicInitFrom(t, p2, n.pc))
-	if got := n.sent[sessionTypePQInfo].Load() + n.sent[sessionTypePQInit].Load(); got != before {
-		t.Fatalf("%d PQInfos or PQ inits to a key past the most", got-before)
-	}
-	if session(n, &pqNode{pub: p2.publicEd[:]}) != "classic" {
-		t.Fatal("no classic session past the most")
-	}
-	// a key held to PQ: its PQ session all the same
-	n.pc.pq.markSticky(&k3, p3.pqOwn().notAfter, true)
-	deliver(k3, pqInitFrom(t, p3, n.pc))
 	if n.pc.PQSessionCount() != 2 || n.sent[sessionTypePQAck].Load() != 2 {
-		t.Fatalf("a sticky key past the most: %d PQ sessions, %d acks", n.pc.PQSessionCount(), n.sent[sessionTypePQAck].Load())
+		t.Fatalf("a peer's PQ init past SessionMax: %d PQ sessions, %d acks", n.pc.PQSessionCount(), n.sent[sessionTypePQAck].Load())
+	}
+	// a classic handshake with p3, its ML-KEM key known: classic, and nothing of PQ from us
+	knows(t, n.pc, p3)
+	before := n.sent[sessionTypePQInfo].Load() + n.sent[sessionTypePQInit].Load()
+	deliver(k3, classicInitFrom(t, p3, n.pc))
+	if got := n.sent[sessionTypePQInfo].Load() + n.sent[sessionTypePQInit].Load(); got != before {
+		t.Fatalf("%d PQInfos or PQ inits to a key past SessionMax", got-before)
+	}
+	if session(n, &pqNode{pub: p3.publicEd[:]}) != "classic" {
+		t.Fatal("no classic session past SessionMax")
+	}
+	if log.count("(PQConfig.SessionMax): none started") != 1 {
+		t.Fatalf("log: %q", log.all())
 	}
 	n.pc.SetPQ(PQConfig{})
 	if n.pc.PQSessionCount() != 0 {
@@ -890,7 +925,7 @@ func TestPQPendingResealedOnInfo(t *testing.T) {
 	if ok, _ := a.pc.pq.accept(&bKey, &stale, staleSeq, staleSeq+uint64(pqKeyValidity/time.Second)); !ok {
 		t.Fatal("the stale key not taken")
 	}
-	phony.Block(&a.pc.sessions, func() { a.pc.sessions._startPQ(&bKey, a.pc.pq.usableKey(&bKey)) })
+	phony.Block(&a.pc.sessions, func() { a.pc.sessions._startPQ(&bKey, a.pc.pq.usableKey(&bKey), false) })
 	a.pc.sessions.handleData(nil, &bKey, append(allocBytes(0), bOwn.info...))
 	phony.Block(&a.pc.sessions, func() {})
 	mu.Lock()

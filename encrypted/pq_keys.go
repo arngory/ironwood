@@ -12,27 +12,38 @@ import (
 )
 
 // PQConfig turns on the hybrid post-quantum sessions (niko docs/design/ironwood-pq.md). Off, a PacketConn sends no
-// PQ packet and drops those that come, as a node without them does: its bytes on the wire are upstream's. Its replies
-// are not timed as upstream's, PQ on or off: an init in reply to traffic goes at most once in initReplyInterval (3 s)
-// per key, and a repeated init is answered at most once in half pqInitRetry (1 s).
+// PQ packet of its own and drops those that come, as a node without them does: what it sends of its own is
+// upstream's, byte for byte. Its replies are not upstream's in all: an init in reply to traffic goes at most once in
+// initReplyInterval (3 s) per key, PQ on or off, and a repeated init is answered at most once in half pqInitRetry
+// (1 s); off, PQ traffic (0x13) from a key with no session gets a classic init in reply, as classic traffic does (a
+// peer that held a PQ session with us hears from us again; upstream's nodes send no 0x13).
 //
-// An empty message (WriteTo with no bytes) is not delivered over a PQ session: an empty PQ packet is the probe that
-// confirms a session. Over a classic one it is delivered, as upstream does.
+// A PQ session is kept up by what opens under it, not by what we send: nothing opened in a minute, it goes, so that
+// a peer that dropped it (PQ turned off, a restart) is noticed. A side that only reads sends an empty PQ packet once
+// it sent nothing for half a minute, so that a one-way flow keeps its session. An empty message (WriteTo with no bytes) is not
+// delivered over a PQ session: an empty PQ packet is the probe that confirms a session. Over a classic one it is
+// delivered, as upstream does.
 type PQConfig struct {
 	Enabled bool
 	// Required reports the keys a session with must be PQ: classic init, ack and traffic from them are dropped,
 	// and none goes to them. Others are "where possible": classic at once, PQ in its place once both ends know each
 	// other's ML-KEM key. A key that had a PQ session in this process (a PQ packet of it opened, or its verified PQ
-	// ack came with no classic session beside) is held to PQ too, until the end (notAfter) of the newest ML-KEM key
-	// of it seen here, which its later PQInfos and inits move on. Nil: none.
+	// ack came with no classic session beside) is held to PQ too, for as long as its ML-KEM key lasts: until the
+	// end (notAfter) of that key and the clock slack (3 days), and never more than pqKeyValidity (2 days) from the last
+	// time it was held. Its PQ traffic (under the key of its session) and its newer keys move that on. Nil: none.
 	Required func(key ed25519.PublicKey) bool
 	// Logf takes the warnings: a PQInfo refused by its time (with the difference of the clocks), a key with a lower
 	// number taken after a restart, a key held to PQ that asks for classic, a PQ session that did not come up. Nil:
 	// none.
 	Logf func(format string, args ...any)
-	// SessionMax is the most PQ sessions at once, with traffic opened under them or not; each holds some 18 KB (a
-	// classic one 2.4). Past it, a key that may be classic gets a classic session (a line in the log); a key held to PQ
-	// gets its PQ one all the same. PacketConn.PQSessionCount tells how many are up. 0: 2048.
+	// SessionMax is the most PQ sessions up, with traffic opened under them or not, for this node to start a PQ one
+	// with a peer that may be classic: past it, a new peer gets a classic session (a line in the log). Each PQ session
+	// holds some 18 KB (a classic one 2.4). A peer that starts PQ with us still gets it, and so does a key held to PQ,
+	// up to a hard limit of SessionMax and a quarter of it more (at least 64 more). At the hard limit the PQ session
+	// with nothing opened under it for the longest goes (one of a key held to PQ last), its classic one taking its
+	// place where there is one; with every PQ session in use, the new one is refused (classic where the key may be).
+	// Anyone with keys of its own can fill it with signed PQ inits: memory stays bounded, and new peers that may be
+	// classic get classic sessions meanwhile. PacketConn.PQSessionCount tells how many are up. 0: 2048.
 	SessionMax int
 }
 
@@ -47,11 +58,12 @@ var (
 	pqRollbackTries   = 3
 	pqRollbackAfter   = 30 * time.Second
 	pqStaleGrace      = 3 * time.Second
-	pqPendingTimeout  = sessionTimeout  // a PQ init of ours unanswered this long is given up
-	pqUpgradeRetry    = 5 * time.Minute // then, on a classic session, tried again after this
-	pqUnconfirmedMax  = 1024            // PQ sessions no traffic opened under yet
-	pqProbeInterval   = time.Second     // an empty PQ packet, while a classic session beside a PQ one carries traffic
-	pqSessionMax      = 2048            // PQ sessions, by default (PQConfig.SessionMax)
+	pqPendingTimeout  = sessionTimeout   // a PQ init of ours unanswered this long is given up
+	pqUpgradeRetry    = 5 * time.Minute  // then, on a classic session, tried again after this
+	pqUnconfirmedMax  = 1024             // PQ sessions no traffic opened under yet
+	pqProbeInterval   = time.Second      // an empty PQ packet, while a classic session beside a PQ one carries traffic
+	pqSessionMax      = 2048             // PQ sessions, by default (PQConfig.SessionMax)
+	pqEvictIdle       = 10 * time.Second // at the hard limit, a PQ session nothing opened under in this long may go
 	pqPeersMax        = 4096
 	pqStickyMax       = 65536
 	pqStickyRefresh   = time.Minute // a sticky key with traffic opened is raised in the LRU at most once in this
@@ -86,7 +98,7 @@ type pqState struct {
 	sticky    map[edPub]*list.Element // of *stickyKey
 	stickyLRU list.List
 	// the last line in the log of each kind that may come from many keys: one a pqLogInterval
-	stickyLogged, askedLogged, fullLogged, unconfirmedLogged, noPQLogged time.Time
+	stickyLogged, askedLogged, fullLogged, hardLogged, refusedLogged, unconfirmedLogged, noPQLogged, timeLogged time.Time
 	// pqStickyMax, pqPendingTimeout, pqUpgradeRetry and pqPeersMax, a test's own
 	stickyMax      int
 	pendingTimeout time.Duration
@@ -95,9 +107,9 @@ type pqState struct {
 }
 
 type stickyKey struct {
-	ed       edPub
-	traffic  bool
-	notAfter uint64 // held until then: the end of the newest ML-KEM key of it seen (no clock slack)
+	ed      edPub
+	traffic bool
+	until   uint64 // held until then (Unix seconds): holdUntil
 }
 
 type pqLimit struct {
@@ -142,21 +154,21 @@ func (s *pqState) required(key *edPub) bool {
 	return cfg.Required(k[:])
 }
 
-// isSticky: key is held to PQ sessions (it had one here), its notAfter not past
+// isSticky: key is held to PQ sessions (it had one here), its hold not past
 func (s *pqState) isSticky(key *edPub) bool {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	return s._held(key) != nil
 }
 
-// _held: key's sticky entry, nil if none or past its notAfter (such an entry goes). Under s.mu.
+// _held: key's sticky entry, nil if none or past its hold (such an entry goes). Under s.mu.
 func (s *pqState) _held(key *edPub) *stickyKey {
 	e, ok := s.sticky[*key]
 	if !ok {
 		return nil
 	}
 	k := e.Value.(*stickyKey)
-	if s.now().Unix() > int64(k.notAfter) {
+	if s.now().Unix() > int64(k.until) {
 		s.stickyLRU.Remove(e)
 		delete(s.sticky, *key)
 		return nil
@@ -164,29 +176,34 @@ func (s *pqState) _held(key *edPub) *stickyKey {
 	return k
 }
 
-// markSticky: key had a PQ session, by a verified ack, or by traffic that opened (traffic); it is held to PQ until
-// notAfter, or the end of a newer key of it in the table. Past pqStickyMax, the least recently marked key with a
-// handshake alone goes first (a full set would otherwise take no new key); each one that goes is a key that can be
-// downgraded again, so it is logged.
+// _holdUntil: the end of a hold on a key under an ML-KEM key that ends at notAfter: that end and the clock slack (a
+// peer's clock may be days off), and no more than pqKeyValidity from now (no hold is longer than a key lasts)
+func (s *pqState) _holdUntil(notAfter uint64) uint64 {
+	return min(uint64(s.now().Unix())+uint64(pqKeyValidity/time.Second), notAfter+uint64(pqClockSlack/time.Second))
+}
+
+// markSticky: key had a PQ session, by a verified ack, or by traffic that opened (traffic), under an ML-KEM key of it
+// that ends at notAfter (the key of the session, not a newer one in the table: a session under a key the peer no
+// longer announces holds it no longer than that key); it is held to PQ until _holdUntil. Past pqStickyMax, the
+// least recently marked key with a handshake alone goes first (a full set would otherwise take no new key); each one
+// that goes is a key that can be downgraded again, so it is logged.
 func (s *pqState) markSticky(key *edPub, notAfter uint64, traffic bool) {
 	s.mu.Lock()
-	defer s.mu.Unlock()
-	if e, ok := s.peers[*key]; ok {
-		if p := e.Value.(*pqPeer); p.key != nil {
-			notAfter = max(notAfter, p.key.notAfter)
-		}
-	}
+	until := s._holdUntil(notAfter)
 	if k := s._held(key); k != nil {
 		s.stickyLRU.MoveToFront(s.sticky[*key])
 		k.traffic = k.traffic || traffic
-		k.notAfter = max(k.notAfter, notAfter)
+		k.until = max(k.until, until)
+		s.mu.Unlock()
 		return
 	}
-	if s.now().Unix() > int64(notAfter) {
+	if s.now().Unix() > int64(until) {
+		s.mu.Unlock()
 		return // its key is out of time by our clock: not held
 	}
-	s.sticky[*key] = s.stickyLRU.PushFront(&stickyKey{ed: *key, traffic: traffic, notAfter: notAfter})
+	s.sticky[*key] = s.stickyLRU.PushFront(&stickyKey{ed: *key, traffic: traffic, until: until})
 	if len(s.sticky) <= s.stickyMax {
+		s.mu.Unlock()
 		return
 	}
 	victim := s.stickyLRU.Back()
@@ -199,22 +216,31 @@ func (s *pqState) markSticky(key *edPub, notAfter uint64, traffic bool) {
 	gone := victim.Value.(*stickyKey)
 	s.stickyLRU.Remove(victim)
 	delete(s.sticky, gone.ed)
-	s._logEvery(&s.stickyLogged, "PQ: %d keys hold to PQ sessions, the most kept: %x is no longer held to them", s.stickyMax, gone.ed[:8])
-}
-
-// _logEvery: a line in the log, unless one went at *at less than pqLogInterval ago. Under s.mu.
-func (s *pqState) _logEvery(at *time.Time, format string, args ...any) {
-	if now := s.now(); now.Sub(*at) >= pqLogInterval {
-		*at = now
-		s.logf(format, args...)
+	due := s._due(&s.stickyLogged)
+	s.mu.Unlock()
+	if due {
+		s.logf("PQ: %d keys hold to PQ sessions, the most kept: %x is no longer held to them", s.stickyMax, gone.ed[:8])
 	}
 }
 
-// logEvery: _logEvery, s.mu taken
+// _due: a line in the log of the kind last logged at *at may go now (at most one a pqLogInterval); counts it as
+// logged. Under s.mu; the line itself goes after s.mu is let go (logf calls the embedder's Logf).
+func (s *pqState) _due(at *time.Time) bool {
+	if now := s.now(); now.Sub(*at) >= pqLogInterval {
+		*at = now
+		return true
+	}
+	return false
+}
+
+// logEvery: a line in the log, unless one of its kind (at) went less than pqLogInterval ago
 func (s *pqState) logEvery(at *time.Time, format string, args ...any) {
 	s.mu.Lock()
-	defer s.mu.Unlock()
-	s._logEvery(at, format, args...)
+	due := s._due(at)
+	s.mu.Unlock()
+	if due {
+		s.logf(format, args...)
+	}
 }
 
 // logDue: a line at *at may go now (nothing is counted as sent)
@@ -230,6 +256,12 @@ func (s *pqState) sessionMax() int {
 		return cfg.SessionMax
 	}
 	return pqSessionMax
+}
+
+// hardMax: the most PQ sessions at all, SessionMax and a quarter of it more (at least 64 more)
+func (s *pqState) hardMax() int {
+	most := s.sessionMax()
+	return most + max(64, most/4)
 }
 
 func (s *pqState) nextSecretNo() uint64 {
@@ -464,27 +496,26 @@ func (s *pqState) usableKey(ed *edPub) *pqPeerKey {
 // and taken once PQ inits under the key in use go unanswered (takeRollback). accepted: the key in use is this one;
 // updated: it just became so.
 func (s *pqState) accept(ed *edPub, pub *pqPub, seq, notAfter uint64) (accepted, updated bool) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
 	now := s.now()
 	if !s.plausible(seq, notAfter) {
 		return false, false
 	}
-	p := s._peer(ed)
 	if now.Unix() > int64(notAfter)+int64(pqClockSlack/time.Second) {
-		if now.Sub(p.loggedAt) >= pqLogInterval {
-			p.loggedAt = now
-			s.logf("PQ: the ML-KEM key of %x is out of time by our clock (%s past its end, more than %s): refused; are the clocks right?",
-				ed[:8], now.Sub(time.Unix(int64(notAfter), 0)).Round(time.Second), pqClockSlack)
-		}
+		// before any entry is made: a PQInfo out of time, replayed, would make its key one with an entry here (and our
+		// answers to packets claimed from it would skip the bucket)
+		s.logEvery(&s.timeLogged, "PQ: the ML-KEM key of %x is out of time by our clock (%s past its end, more than %s): refused; are the clocks right?",
+			ed[:8], now.Sub(time.Unix(int64(notAfter), 0)).Round(time.Second), pqClockSlack)
 		return false, false
 	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	p := s._peer(ed)
 	switch {
 	case p.key == nil || seq > p.key.seq:
 		if k := newPQPeerKey(ed, pub, seq, notAfter); k != nil {
 			p.key, p.rollback = k, nil
 			if held := s._held(ed); held != nil {
-				held.notAfter = max(held.notAfter, notAfter) // a newer key of a sticky one: held to PQ until its end
+				held.until = max(held.until, s._holdUntil(notAfter)) // a newer key of a sticky one: held to PQ for it
 			}
 			return true, true
 		}
@@ -497,8 +528,8 @@ func (s *pqState) accept(ed *edPub, pub *pqPub, seq, notAfter uint64) (accepted,
 }
 
 // plausible: a key numbered no further ahead than the clocks can be apart, and valid no longer than any key is made
-// for. One beyond either, replayed, would take the table's place of every real key after it (a lower number is a
-// rollback, kept aside).
+// for (so its notAfter is at most pqKeyValidity and pqClockSlack from now). One beyond either, replayed, would take
+// the table's place of every real key after it (a lower number is a rollback, kept aside).
 func (s *pqState) plausible(seq, notAfter uint64) bool {
 	now := uint64(s.now().Unix())
 	return seq <= now+uint64(pqClockSlack/time.Second) && notAfter >= seq && notAfter-seq <= uint64(pqKeyValidity/time.Second)
@@ -508,16 +539,16 @@ func (s *pqState) plausible(seq, notAfter uint64) bool {
 // once in pqLogInterval
 func (s *pqState) logStripped(ed *edPub, what, then string) {
 	s.mu.Lock()
-	defer s.mu.Unlock()
 	e, ok := s.peers[*ed]
 	if !ok {
+		s.mu.Unlock()
 		return
 	}
-	p, now := e.Value.(*pqPeer), s.now()
-	if now.Sub(p.loggedAt) < pqLogInterval {
+	due := s._due(&e.Value.(*pqPeer).loggedAt)
+	s.mu.Unlock()
+	if !due {
 		return
 	}
-	p.loggedAt = now
 	s.logf("PQ: %x announced an ML-KEM key, and %s in %s: %s (PQ packets lost or dropped on the way?)",
 		ed[:8], what, s.pendingTimeout, then)
 }
@@ -525,34 +556,37 @@ func (s *pqState) logStripped(ed *edPub, what, then string) {
 // takeRollback: the lower-numbered key kept aside for ed, now in use, if it is still within its notAfter
 func (s *pqState) takeRollback(ed *edPub) *pqPeerKey {
 	s.mu.Lock()
-	defer s.mu.Unlock()
 	e, ok := s.peers[*ed]
 	if !ok {
+		s.mu.Unlock()
 		return nil
 	}
 	p := e.Value.(*pqPeer)
 	k := p.rollback
 	p.rollback = nil
 	if !s._live(k, 0) {
+		s.mu.Unlock()
 		return nil
 	}
 	old := p.key
 	p.key = k
+	s.mu.Unlock()
 	s.logf("PQ: %x answers no PQ init under its ML-KEM key number %d; its key number %d, a lower one, taken (a restart with a clock behind?)",
 		ed[:8], old.seq, k.seq)
 	return k
 }
 
-// infoDue: our PQInfo may go to ed now (at most once in pqInfoInterval; to a key with no entry in peers, only with a
-// token of the bucket for all such keys); counts it as sent
-func (s *pqState) infoDue(ed *edPub) bool {
+// infoDue: our PQInfo may go to ed now (at most once in pqInfoInterval; to a key with no entry in peers, or in reply
+// to a packet no one signed (unsigned), only with a token of the bucket for all such asks: the per-key limits are an
+// LRU such packets refill); counts it as sent
+func (s *pqState) infoDue(ed *edPub, unsigned bool) bool {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	l, now := s._limit(ed), s.now()
 	if !l.sentInfoAt.IsZero() && now.Sub(l.sentInfoAt) < pqInfoInterval {
 		return false
 	}
-	if _, known := s.peers[*ed]; !known && !s._token(now) {
+	if _, known := s.peers[*ed]; (!known || unsigned) && !s._token(now) {
 		return false
 	}
 	l.sentInfoAt = now

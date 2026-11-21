@@ -68,6 +68,7 @@ func pqInitFrom(t *testing.T, from, to *PacketConn) []byte {
 // S1: two PQ inits cross, and the lower key's is sealed to an ML-KEM key of its peer older than the one the peer's
 // init came with: it is sealed again to that one at once, not after the init expires (60 s).
 func TestPQCrossedInitsStaleKey(t *testing.T) {
+	t.Parallel()
 	a, b := lowerFirst(requiredBoth(t, nil))
 	// no PQInfo either way: the keys travel in the inits alone
 	a.dropType[sessionTypePQInfo].Store(true)
@@ -88,8 +89,8 @@ func TestPQCrossedInitsStaleKey(t *testing.T) {
 	b.pc.WriteTo([]byte("first of B"), types.Addr(a.pub))
 	time.Sleep(300 * time.Millisecond)
 	b.dropType[sessionTypePQInit].Store(false)
-	if !hears(a, b, "after the crossing", 3*time.Second) {
-		t.Fatalf("nothing over the crossed inits in 3 s: A %s, B %s", session(a, b), session(b, a))
+	if !hears(a, b, "after the crossing", 5*time.Second) {
+		t.Fatalf("nothing over the crossed inits in 5 s: A %s, B %s", session(a, b), session(b, a))
 	}
 	t.Logf("the first packet after %v", time.Since(start).Round(10*time.Millisecond))
 	if !hears(b, a, "and back", 3*time.Second) {
@@ -104,6 +105,7 @@ func TestPQCrossedInitsStaleKey(t *testing.T) {
 // that answered has a PQ session, the other the classic one: traffic goes by the classic session kept beside the PQ
 // one all the while, both ways. Once the acks go through, the sessions are PQ.
 func TestPQAckLostUntilExpiry(t *testing.T) {
+	t.Parallel()
 	a, b := newPQNode(t, pqOn), newPQNode(t, pqOn)
 	for _, n := range []*pqNode{a, b} {
 		n.pc.pq.pendingTimeout, n.pc.pq.upgradeRetry = 3*time.Second, 2*time.Second
@@ -132,7 +134,8 @@ func TestPQAckLostUntilExpiry(t *testing.T) {
 	a.dropType[sessionTypePQAck].Store(false)
 	b.dropType[sessionTypePQAck].Store(false)
 	waitSessions(t, a, b, "pq", 15*time.Second)
-	for !hears(a, b, "settled", time.Second) {
+	if !hears(a, b, "settled", 5*time.Second) {
+		t.Fatal("no traffic over the PQ sessions in 5 s")
 	}
 	if !hears(a, b, "A to B over PQ", 3*time.Second) || !hears(b, a, "B to A over PQ", 3*time.Second) {
 		t.Fatal("no traffic over the PQ sessions")
@@ -145,6 +148,7 @@ func TestPQAckLostUntilExpiry(t *testing.T) {
 // S2: a link that drops PQ traffic (0x13) and carries the rest: for a key that may be classic, traffic goes on by
 // the classic session, and the PQ one gives way to it once nothing of it opened in the time an init is waited for.
 func TestPQTrafficDropped(t *testing.T) {
+	t.Parallel()
 	a, b := newPQNode(t, pqOn), newPQNode(t, pqOn)
 	for _, n := range []*pqNode{a, b} {
 		n.pc.pq.pendingTimeout = 3 * time.Second
@@ -199,6 +203,7 @@ func TestPQUnauthenticated(t *testing.T) {
 
 // S4: an init repeated is answered at most once in half the sender's retry, with the bytes of the first ack.
 func TestPQRepeatInitLimited(t *testing.T) {
+	t.Parallel()
 	a, b := newPQNode(t, pqOn), newPQNode(t, pqOn) // no link: what B sends is only counted
 	aKey := a.key()
 	data := pqInitFrom(t, a.pc, b.pc)
@@ -237,6 +242,7 @@ func TestPQRepeatInitLimited(t *testing.T) {
 
 // S6: PQ turned off drops the PQ sessions: no 0x13 goes out after it, and the next packet starts a classic session.
 func TestPQOffDropsSessions(t *testing.T) {
+	t.Parallel()
 	a, b := newPQNode(t, pqOn), newPQNode(t, PQConfig{Enabled: true})
 	linkPQ(t, a, b)
 	if !hears(a, b, "hello", 3*time.Second) {
@@ -348,6 +354,7 @@ func TestPQInfoForged(t *testing.T) {
 // S9: a node restarted with its clock behind: its peer holds a key of it numbered higher than its own, and its
 // inits under that one go unanswered. After pqRollbackTries, the lower-numbered key it announced is taken.
 func TestPQRollbackTaken(t *testing.T) {
+	t.Parallel()
 	var mu sync.Mutex
 	var logged []string
 	logf := func(f string, args ...any) { mu.Lock(); logged = append(logged, f); mu.Unlock() }
@@ -378,13 +385,15 @@ func TestPQRollbackTaken(t *testing.T) {
 // S9: the epoch byte and the ratchet secret take part in a PQ packet: the epoch changed, or the receiver's secret,
 // the packet does not open; the same packet unchanged, to the secret as it was, does.
 func TestPQTrafficTampered(t *testing.T) {
+	t.Parallel()
 	a, b := newPQNode(t, pqOn), newPQNode(t, pqOn)
 	linkPQ(t, a, b)
 	if !hears(a, b, "hello", 3*time.Second) {
 		t.Fatal("no session")
 	}
 	waitSessions(t, a, b, "pq", 10*time.Second)
-	for !hears(a, b, "settled", time.Second) {
+	if !hears(a, b, "settled", 5*time.Second) {
+		t.Fatal("no traffic over the PQ sessions in 5 s")
 	}
 	captured := make(chan []byte, 2)
 	tap := func(d []byte) bool {
@@ -454,6 +463,7 @@ func TestPQTrafficTampered(t *testing.T) {
 
 // S9: a message of MTU() bytes goes through a PQ session whole, with the peers' message size of Yggdrasil.
 func TestPQMessageOfMTU(t *testing.T) {
+	t.Parallel()
 	size := network.WithPeerMaxMessageSize(65535)
 	a, b := newPQNode(t, pqOn, size), newPQNode(t, pqOn, size)
 	linkPQ(t, a, b)

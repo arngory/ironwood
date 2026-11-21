@@ -267,9 +267,13 @@ func (info *sessionInfo) handleInit(from phony.Actor, init *sessionInit) {
 		}
 		if init.seq == info.seq {
 			// The same init again: its sender has not had our ack, which may have gone out before we had a path back
-			// (and the lookup for one was lost), or got lost on the way. Ack it again, the session as it is: the ack's
-			// traffic looks the path up anew. Ignored, the contact would wait for this session to time out.
-			info._sendAck()
+			// (and the lookup for one was lost), or got lost on the way. Ignored, the contact would wait for this
+			// session to time out. While nothing came from the sender over the session, the very ack of the first
+			// time goes again (its traffic looks the path up anew): a sender with a session drops it by its seq and
+			// keeps its keys. Once traffic came, the sender has the session, and a repeat is a replay: ignored.
+			if info.rx == 0 && info.ack != nil {
+				info.mgr.sendAck(&info.ed, info.ack)
+			}
 			return
 		}
 		info._handleUpdate(init)
@@ -464,6 +468,7 @@ func (info *sessionInfo) _sendInit() {
 func (info *sessionInfo) _sendAck() {
 	init := newSessionInit(&info.sendPub, &info.nextPub, info.localKeySeq)
 	ack := sessionAck{init}
+	info.ack = &ack // sent again, the same, to a repeat of the init it answers (handleInit)
 	info.mgr.sendAck(&info.ed, &ack)
 }
 

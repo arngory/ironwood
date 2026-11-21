@@ -12,6 +12,8 @@ import (
 
 	"testing"
 
+	"github.com/Arceliar/phony"
+
 	"github.com/Arceliar/ironwood/types"
 )
 
@@ -105,6 +107,113 @@ func TestRepeatedInitIsAckedAgain(t *testing.T) {
 		hasPath(a, pubB), hasPath(b, pubA))
 }
 
+// TestReplayedInitKeepsKeys: once the handshake is done and traffic came, the same init again (duplicated by the
+// network, or replayed by someone on the path) answers nothing that moves the sender's keys: the receiver sends no
+// ack, and an ack of the first time would be dropped by its seq. A fresh ack to each replay would ratchet the
+// sender's keys, one replay a second keeping the session renegotiating.
+func TestReplayedInitKeepsKeys(t *testing.T) {
+	pubA, privA, _ := ed25519.GenerateKey(nil)
+	pubB, privB, _ := ed25519.GenerateKey(nil)
+	a, _ := NewPacketConn(privA)
+	defer a.Close()
+	b, _ := NewPacketConn(privB)
+	defer b.Close()
+	cA, cB := newLossyLink(nil)
+	defer cA.Close()
+	go a.HandleConn(pubB, cA, 0)
+	go b.HandleConn(pubA, cB, 0)
+	addrB := types.Addr(pubB)
+	warmPaths(t, a, b, pubA, pubB)
+	go func() {
+		buf := make([]byte, 64)
+		for {
+			if _, _, err := a.ReadFrom(buf); err != nil {
+				return
+			}
+		}
+	}()
+	heard := make(chan string, 16)
+	go func() {
+		buf := make([]byte, 64)
+		for {
+			n, _, err := b.ReadFrom(buf)
+			if err != nil {
+				return
+			}
+			heard <- string(buf[:n])
+		}
+	}()
+	hears := func(msg string) bool {
+		for deadline := time.Now().Add(5 * time.Second); time.Now().Before(deadline); {
+			a.WriteTo([]byte(msg), addrB)
+			select {
+			case got := <-heard:
+				if got == msg {
+					return true
+				}
+			case <-time.After(250 * time.Millisecond):
+			}
+		}
+		return false
+	}
+
+	// the handshake, A's init kept as it went out
+	cA.capture.Store(true)
+	if !hears("hello") {
+		t.Fatal("no handshake in 5 s")
+	}
+	cA.capture.Store(false)
+	frames := cA.frames()
+	if len(frames) == 0 {
+		t.Fatal("no traffic frame captured")
+	}
+	keySeq := func() uint64 {
+		var k edPub
+		copy(k[:], pubB)
+		var info *sessionInfo
+		phony.Block(&a.sessions, func() { info = a.sessions.sessions[k] })
+		if info == nil {
+			t.Fatal("A has no session with B")
+		}
+		var seq uint64
+		phony.Block(info, func() { seq = info.localKeySeq })
+		return seq
+	}
+	// a second on, so that a fresh ack would carry a newer seq than the session has
+	time.Sleep(1100 * time.Millisecond)
+	before := keySeq()
+	for i := 0; i < 2; i++ {
+		cA.replay(frames[0])
+		time.Sleep(1100 * time.Millisecond)
+	}
+	if after := keySeq(); after != before {
+		t.Fatalf("A's keys moved on replays of its init: key seq %d, then %d", before, after)
+	}
+	if !hears("again") {
+		t.Fatal("the session stopped carrying after the replays")
+	}
+}
+
+// warmPaths: a path each way, without a session: packets below the sessions, ignored by them.
+func warmPaths(t *testing.T, a, b *PacketConn, pubA, pubB ed25519.PublicKey) {
+	t.Helper()
+	hasPath := func(pc *PacketConn, key ed25519.PublicKey) bool {
+		for _, p := range pc.PacketConn.Debug.GetPaths() {
+			if bytes.Equal(p.Key, key) {
+				return true
+			}
+		}
+		return false
+	}
+	for deadline := time.Now().Add(30 * time.Second); !hasPath(a, pubB) || !hasPath(b, pubA); time.Sleep(100 * time.Millisecond) {
+		if time.Now().After(deadline) {
+			t.Fatal("no paths between the two nodes in 30 s")
+		}
+		a.PacketConn.WriteTo([]byte{sessionTypeDummy}, types.Addr(pubB))
+		b.PacketConn.WriteTo([]byte{sessionTypeDummy}, types.Addr(pubA))
+	}
+}
+
 // wireTraffic is the network package's frame type of traffic (network/wire.go): what a session's init, ack and data
 // ride in.
 const wireTraffic = 9
@@ -121,6 +230,26 @@ type lossyConn struct {
 	closed     chan struct{}
 	closeOnce  *sync.Once
 	drop       *atomic.Bool
+	// while capture is set, the traffic frames written are kept too (captured), for replay
+	capture  atomic.Bool
+	captured [][]byte
+}
+
+// replay writes a frame again, as the network would if it duplicated it (or someone on the path replayed it).
+func (c *lossyConn) replay(frame []byte) {
+	c.writeLock.Lock()
+	defer c.writeLock.Unlock()
+	select {
+	case <-c.closed:
+	case c.send <- append([]byte(nil), frame...):
+	}
+}
+
+// frames: the captured traffic frames so far.
+func (c *lossyConn) frames() [][]byte {
+	c.writeLock.Lock()
+	defer c.writeLock.Unlock()
+	return append([][]byte(nil), c.captured...)
 }
 
 // newLossyLink: two ends, the second's traffic frames (B to A) lost while drop is set.
@@ -151,25 +280,26 @@ func (c *lossyConn) Read(p []byte) (int, error) {
 func (c *lossyConn) Write(p []byte) (int, error) {
 	c.writeLock.Lock()
 	defer c.writeLock.Unlock()
-	out := append([]byte(nil), p...)
-	if c.drop != nil {
-		// whole frames only: a write may end inside one, the rest comes with the next
-		c.pending = append(c.pending, p...)
-		out = out[:0]
-		for {
-			size, n := binary.Uvarint(c.pending)
-			if n <= 0 || len(c.pending) < n+int(size) {
-				break
-			}
-			frame := c.pending[:n+int(size)]
-			if !(c.drop.Load() && size > 0 && frame[n] == wireTraffic) {
-				out = append(out, frame...)
-			}
-			c.pending = c.pending[n+int(size):]
+	// whole frames only: a write may end inside one, the rest comes with the next
+	c.pending = append(c.pending, p...)
+	var out []byte
+	for {
+		size, n := binary.Uvarint(c.pending)
+		if n <= 0 || len(c.pending) < n+int(size) {
+			break
 		}
-		if len(out) == 0 {
-			return len(p), nil
+		frame := c.pending[:n+int(size)]
+		traffic := size > 0 && frame[n] == wireTraffic
+		if traffic && c.capture.Load() {
+			c.captured = append(c.captured, append([]byte(nil), frame...))
 		}
+		if !(traffic && c.drop != nil && c.drop.Load()) {
+			out = append(out, frame...)
+		}
+		c.pending = c.pending[n+int(size):]
+	}
+	if len(out) == 0 {
+		return len(p), nil
 	}
 	select {
 	case <-c.closed:

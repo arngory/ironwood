@@ -1,12 +1,11 @@
 package encrypted
 
 import (
+	"crypto/cipher"
 	"encoding/binary"
 	"time"
 
 	"github.com/Arceliar/phony"
-
-	"github.com/Arceliar/ironwood/types"
 )
 
 /*
@@ -37,15 +36,17 @@ const (
 
 type sessionManager struct {
 	phony.Inbox
-	pc       *PacketConn
-	sessions map[edPub]*sessionInfo
-	buffers  map[edPub]*sessionBuffer
+	pc        *PacketConn
+	sessions  map[edPub]*sessionInfo
+	buffers   map[edPub]*sessionBuffer
+	pqPending map[edPub]*pqPending
 }
 
 func (mgr *sessionManager) init(pc *PacketConn) {
 	mgr.pc = pc
 	mgr.sessions = make(map[edPub]*sessionInfo)
 	mgr.buffers = make(map[edPub]*sessionBuffer)
+	mgr.pqPending = make(map[edPub]*pqPending)
 }
 
 func (mgr *sessionManager) _newSession(ed *edPub, recv, send boxPub, seq uint64) *sessionInfo {
@@ -80,22 +81,42 @@ func (mgr *sessionManager) handleData(from phony.Actor, pub *edPub, data []byte)
 		if len(data) == 0 {
 			return
 		}
+		pq := mgr.pc.pq.enabled()
 		switch data[0] {
 		case sessionTypeDummy:
 		case sessionTypeInit:
-			init := new(sessionInit)
-			if init.decrypt(&mgr.pc.secretBox, pub, data, mgr.pc.groupAuth) {
+			if mgr.pqRefusesClassic(pub) {
+				// it must be PQ: our PQInfo, so that it can start a PQ init if it has them
+				mgr._sendPQInfoDue(pub)
+			} else if init := new(sessionInit); init.decrypt(&mgr.pc.secretBox, pub, data, mgr.pc.groupAuth) {
 				mgr._handleInit(pub, init)
 			}
 			freeBytes(data)
 		case sessionTypeAck:
-			ack := new(sessionAck)
-			if ack.decrypt(&mgr.pc.secretBox, pub, data, mgr.pc.groupAuth) {
+			if mgr.pqRefusesClassic(pub) {
+				mgr._sendPQInfoDue(pub)
+			} else if ack := new(sessionAck); ack.decrypt(&mgr.pc.secretBox, pub, data, mgr.pc.groupAuth) {
 				mgr._handleAck(pub, ack)
 			}
 			freeBytes(data)
 		case sessionTypeTraffic:
 			mgr._handleTraffic(pub, data)
+		case sessionTypePQInfo:
+			if pq {
+				mgr._handlePQInfo(pub, data)
+			}
+			freeBytes(data)
+		case sessionTypePQInit, sessionTypePQAck:
+			if pq {
+				mgr._handlePQInit(pub, data, data[0] == sessionTypePQAck)
+			}
+			freeBytes(data)
+		case sessionTypePQTraffic:
+			if pq {
+				mgr._handlePQTraffic(pub, data)
+			} else {
+				freeBytes(data)
+			}
 		default:
 		}
 	})
@@ -103,10 +124,11 @@ func (mgr *sessionManager) handleData(from phony.Actor, pub *edPub, data []byte)
 
 func (mgr *sessionManager) _handleInit(pub *edPub, init *sessionInit) {
 	if info, buf := mgr._sessionForInit(pub, init); info != nil {
-		info.handleInit(mgr, init)
+		info.handleInit(mgr, init, nil)
 		if buf != nil && buf.data != nil {
 			info.doSend(mgr, buf.data)
 		}
+		mgr._maybeStartPQ(pub)
 	}
 }
 
@@ -114,19 +136,27 @@ func (mgr *sessionManager) _handleAck(pub *edPub, ack *sessionAck) {
 	_, isOld := mgr.sessions[*pub]
 	if info, buf := mgr._sessionForInit(pub, &ack.sessionInit); info != nil {
 		if isOld {
-			info.handleAck(mgr, ack)
+			info.handleAck(mgr, ack, nil)
 		} else {
-			info.handleInit(mgr, &ack.sessionInit)
+			info.handleInit(mgr, &ack.sessionInit, nil)
 		}
 		if buf != nil && buf.data != nil {
 			info.doSend(mgr, buf.data)
 		}
+		mgr._maybeStartPQ(pub)
 	}
 }
 
 func (mgr *sessionManager) _handleTraffic(pub *edPub, msg []byte) {
 	if info := mgr.sessions[*pub]; info != nil {
+		// a PQ session drops it (a classic packet sent before the PQ session took the classic one's place)
 		info.doRecv(mgr, msg)
+	} else if mgr.pc.pq.required(pub) {
+		mgr._sendPQInfoDue(pub)
+		freeBytes(msg)
+	} else if !mgr.pc.pq.initReplyDue(pub) {
+		// one init in reply per initReplyInterval: every packet of a stream would send one
+		freeBytes(msg)
 	} else {
 		// We don't know that the node really exists, it could be spoofed/replay
 		// So we don't want to save session or a buffer based on this node
@@ -136,13 +166,20 @@ func (mgr *sessionManager) _handleTraffic(pub *edPub, msg []byte) {
 		nextPub, _ := newBoxKeys()
 		init := newSessionInit(&currentPub, &nextPub, 0)
 		mgr.sendInit(pub, &init)
+		freeBytes(msg)
 	}
 }
 
 func (mgr *sessionManager) writeTo(toKey edPub, msg []byte) {
 	// WARNING: unsafe to call from within an actor, must only be exposed over the PacketConn functions (which are, themselves, unsafe for actors to call in most cases, since they may block)
 	phony.Block(mgr, func() {
-		if info := mgr.sessions[toKey]; info != nil {
+		info := mgr.sessions[toKey]
+		if info != nil && !info.pq && mgr.pc.pq.required(&toKey) {
+			// the key became one that must be PQ (its node announced it): the classic session goes
+			delete(mgr.sessions, toKey)
+			info = nil
+		}
+		if info != nil {
 			info.doSend(mgr, msg)
 		} else {
 			// Need to buffer the traffic
@@ -166,7 +203,10 @@ func (mgr *sessionManager) _bufferAndInit(toKey edPub, msg []byte) {
 	}
 	buf.data = msg
 	buf.timer.Stop()
-	mgr.sendInit(&toKey, &buf.init)
+	if !mgr.pc.pq.required(&toKey) {
+		mgr.sendInit(&toKey, &buf.init)
+	}
+	mgr._maybeStartPQ(&toKey)
 	buf.timer = time.AfterFunc(sessionTimeout, func() {
 		mgr.Act(nil, func() {
 			if b := mgr.buffers[toKey]; b == buf {
@@ -179,13 +219,13 @@ func (mgr *sessionManager) _bufferAndInit(toKey edPub, msg []byte) {
 
 func (mgr *sessionManager) sendInit(dest *edPub, init *sessionInit) {
 	if bs, err := init.encrypt(&mgr.pc.secretEd, dest, mgr.pc.groupAuth); err == nil {
-		mgr.pc.PacketConn.WriteTo(bs, types.Addr(dest.asKey()))
+		mgr.pc.writeRaw(bs, dest)
 	}
 }
 
 func (mgr *sessionManager) sendAck(dest *edPub, ack *sessionAck) {
 	if bs, err := ack.encrypt(&mgr.pc.secretEd, dest, mgr.pc.groupAuth); err == nil {
-		mgr.pc.PacketConn.WriteTo(bs, types.Addr(dest.asKey()))
+		mgr.pc.writeRaw(bs, dest)
 	}
 }
 
@@ -222,7 +262,33 @@ type sessionInfo struct {
 	nextSendNonce  uint64
 	nextRecvShared boxShared
 	nextRecvNonce  uint64
+	// a PQ session (pq_session.go): traffic of type sessionTypePQTraffic on keys from pqTrafficKey
+	pq           bool
+	peerSecret   ratchetSecret // the peer's, from its last init or ack: our traffic to it is keyed with it
+	peerSecretNo uint64
+	peerKey      *pqPeerKey    // the ML-KEM key its last init or ack came with
+	own          []pqOwnSecret // ours that went in our inits and acks, the newest first
+	keyGen       uint64        // counts _fixShared: the keys cached for an older count are stale
+	sendAEAD     cipher.AEAD
+	sendGen      uint64
+	pqAck        *pqInit // as ack, for a repeat of the init it answers
+	lastOpened   time.Time
 }
+
+// pqOwnSecret is a ratchet secret of ours a peer may key its traffic to us with: the newest until a packet under it
+// comes; older ones still sessionTimeout after that (packets reordered on the way). The peer names it by the low
+// byte of its number (the epoch); the numbers are the process's, so two secrets of a session may share the byte,
+// and each that does is tried.
+type pqOwnSecret struct {
+	secret    ratchetSecret
+	no        uint64
+	confirmed bool      // a packet under it came
+	until     time.Time // zero: kept
+	recv      [3]cipher.AEAD
+	gen       uint64
+}
+
+const pqOwnSecretsMax = 4
 
 func newSession(ed *edPub, current, next boxPub, seq uint64) *sessionInfo {
 	info := new(sessionInfo)
@@ -239,6 +305,7 @@ func newSession(ed *edPub, current, next boxPub, seq uint64) *sessionInfo {
 
 // happens at session creation or after receiving an init/ack
 func (info *sessionInfo) _fixShared(recvNonce, sendNonce uint64) {
+	info.keyGen++
 	getShared(&info.recvShared, &info.current, &info.recvPriv)
 	getShared(&info.sendShared, &info.current, &info.sendPriv)
 	getShared(&info.nextSendShared, &info.next, &info.sendPriv)
@@ -264,7 +331,8 @@ func (info *sessionInfo) _resetTimer() {
 	})
 }
 
-func (info *sessionInfo) handleInit(from phony.Actor, init *sessionInit) {
+// handleInit takes an init (pqi: it as a PQ init, nil for a classic one)
+func (info *sessionInfo) handleInit(from phony.Actor, init *sessionInit, pqi *pqInit) {
 	info.Act(from, func() {
 		if init.seq < info.seq {
 			return
@@ -275,28 +343,37 @@ func (info *sessionInfo) handleInit(from phony.Actor, init *sessionInit) {
 			// session to time out. While nothing came from the sender over the session, the very ack of the first
 			// time goes again (its traffic looks the path up anew): a sender with a session drops it by its seq and
 			// keeps its keys. Once traffic came, the sender has the session, and a repeat is a replay: ignored.
-			if info.rx == 0 && info.ack != nil {
+			if info.rx == 0 && info.pqAck != nil {
+				info.mgr.sendPQAck(&info.ed, info.pqAck, info.peerKey)
+			} else if info.rx == 0 && info.ack != nil {
 				info.mgr.sendAck(&info.ed, info.ack)
 			}
 			return
 		}
-		info._handleUpdate(init)
+		info._handleUpdate(init, pqi, true)
 		// Send a sessionAck
 		info._sendAck()
 	})
 }
 
-func (info *sessionInfo) handleAck(from phony.Actor, ack *sessionAck) {
+func (info *sessionInfo) handleAck(from phony.Actor, ack *sessionAck, pqi *pqInit) {
 	info.Act(from, func() {
 		if ack.seq <= info.seq {
 			return
 		}
-		info._handleUpdate(&ack.sessionInit)
+		info._handleUpdate(&ack.sessionInit, pqi, false)
 	})
 }
 
-// return true if everything looks OK and the session was updated
-func (info *sessionInfo) _handleUpdate(init *sessionInit) {
+// _handleUpdate takes the peer's keys from an init or ack. A PQ one brings its ratchet secret too; one we answer
+// (answering) gets a new secret of ours in the ack.
+func (info *sessionInfo) _handleUpdate(init *sessionInit, pqi *pqInit, answering bool) {
+	if pqi != nil {
+		info.peerSecret, info.peerSecretNo, info.peerKey = pqi.secret, pqi.secretNo, pqi.senderKey
+		if answering {
+			info._newOwnSecret()
+		}
+	}
 	info.current = init.current
 	info.next = init.next
 	info.seq = init.seq
@@ -324,23 +401,39 @@ func (info *sessionInfo) doSend(from phony.Actor, msg []byte) {
 			info.localKeySeq++
 			info._fixShared(0, 0)
 		}
-		bs := allocBytes(sessionTrafficOverhead + len(msg))
+		bs := allocBytes(pqTrafficOverhead + len(msg))
 		defer freeBytes(bs)
 		bs[0] = sessionTypeTraffic
+		if info.pq {
+			bs[0] = sessionTypePQTraffic
+		}
 		offset := 1
 		offset += binary.PutUvarint(bs[offset:], info.localKeySeq)
 		offset += binary.PutUvarint(bs[offset:], info.remoteKeySeq)
 		offset += binary.PutUvarint(bs[offset:], info.sendNonce)
+		if info.pq {
+			// the epoch: which of the peer's secrets the key is from
+			bs[offset] = byte(info.peerSecretNo)
+			offset++
+		}
 		bs = bs[:offset]
 		// We need to include info.nextPub below the layer of encryption
 		// That way the remote side knows it's us when we send from it later...
 		tmp := allocBytes(len(info.nextPub) + len(msg))[:0]
 		tmp = append(tmp, info.nextPub[:]...)
 		tmp = append(tmp, msg...)
-		bs = boxSeal(bs, tmp, info.sendNonce, &info.sendShared)
+		if info.pq {
+			// the whole header is associated data: no number in it can be changed on the way
+			var header [32]byte
+			ad := header[:copy(header[:], bs)]
+			nonce := pqNonce(info.sendNonce)
+			bs = info._sendCipher().Seal(bs, nonce[:], tmp, ad)
+		} else {
+			bs = boxSeal(bs, tmp, info.sendNonce, &info.sendShared)
+		}
 		freeBytes(tmp)
 		// send
-		info.mgr.pc.PacketConn.WriteTo(bs, types.Addr(info.ed[:]))
+		info.mgr.pc.writeRaw(bs, &info.ed)
 		info.tx += uint64(len(msg))
 		info._resetTimer()
 	})
@@ -351,7 +444,12 @@ func (info *sessionInfo) doRecv(from phony.Actor, msg []byte) {
 	info.Act(from, func() {
 		orig := msg
 		defer freeBytes(orig)
-		if len(msg) < sessionTrafficOverheadMin || msg[0] != sessionTypeTraffic {
+		minSize, msgType := sessionTrafficOverheadMin, byte(sessionTypeTraffic)
+		if info.pq {
+			minSize, msgType = pqTrafficOverheadMin, sessionTypePQTraffic
+		}
+		if len(msg) < minSize || msg[0] != msgType {
+			// a classic packet to a PQ session (sent before it took the classic one's place), or the reverse
 			return
 		}
 		offset := 1
@@ -370,12 +468,23 @@ func (info *sessionInfo) doRecv(from phony.Actor, msg []byte) {
 			return
 		}
 		offset += nonceLen
+		var epoch byte
+		if info.pq {
+			if offset >= len(msg) {
+				return
+			}
+			epoch = msg[offset]
+			offset++
+		}
+		var header [32]byte
+		ad := header[:copy(header[:], orig[:offset])]
 		msg := msg[offset:]
 		fromCurrent := remoteKeySeq == info.remoteKeySeq
 		fromNext := remoteKeySeq == info.remoteKeySeq+1
 		toRecv := localKeySeq+1 == info.localKeySeq
 		toSend := localKeySeq == info.localKeySeq
 		var sharedKey *boxShared
+		var pqCase int
 		var onSuccess func(boxPub)
 		switch {
 		case fromCurrent && toRecv:
@@ -386,7 +495,7 @@ func (info *sessionInfo) doRecv(from phony.Actor, msg []byte) {
 			if !info.recvWindow.check(nonce) {
 				return
 			}
-			sharedKey = &info.recvShared
+			sharedKey, pqCase = &info.recvShared, 0
 			onSuccess = func(_ boxPub) {
 				// Commit only after the packet has decrypted, so a
 				// corrupted packet cannot burn a window slot.
@@ -397,7 +506,7 @@ func (info *sessionInfo) doRecv(from phony.Actor, msg []byte) {
 			if !(info.nextSendNonce < nonce) {
 				return
 			}
-			sharedKey = &info.nextSendShared
+			sharedKey, pqCase = &info.nextSendShared, 1
 			onSuccess = func(innerKey boxPub) {
 				info.nextSendNonce = nonce
 				if info.rotated.IsZero() || time.Since(info.rotated) > time.Minute {
@@ -423,7 +532,7 @@ func (info *sessionInfo) doRecv(from phony.Actor, msg []byte) {
 			if !(info.nextRecvNonce < nonce) {
 				return
 			}
-			sharedKey = &info.nextRecvShared
+			sharedKey, pqCase = &info.nextRecvShared, 2
 			onSuccess = func(innerKey boxPub) {
 				info.nextRecvNonce = nonce
 				if info.rotated.IsZero() || time.Since(info.rotated) > time.Minute {
@@ -445,13 +554,27 @@ func (info *sessionInfo) doRecv(from phony.Actor, msg []byte) {
 		default:
 			// We can't make sense of their message
 			// Send a sessionInit and hope they ack so we can fix things
-			info._sendInit()
+			info._sendInitDue()
 			return
 		}
 		// Decrypt and handle packet
 		unboxed, ok := allocBytes(0), false
 		defer func() { freeBytes(unboxed) }()
-		if unboxed, ok = boxOpen(unboxed, msg, nonce, sharedKey); ok {
+		if info.pq {
+			var stale bool
+			unboxed, ok, stale = info._openPQ(unboxed, msg, ad, nonce, epoch, pqCase, sharedKey, remoteKeySeq, localKeySeq)
+			if stale {
+				// under a secret of ours no longer kept: one late packet is dropped without a word (an init would
+				// renegotiate the keys); a peer that keeps to it while nothing opens gets an init, as on a failure
+				if time.Since(info.lastOpened) >= pqStaleGrace {
+					info._sendInitDue()
+				}
+				return
+			}
+		} else {
+			unboxed, ok = boxOpen(unboxed, msg, nonce, sharedKey)
+		}
+		if ok {
 			var key boxPub
 			copy(key[:], unboxed)
 			msg := append(allocBytes(0), unboxed[len(key):]...)
@@ -460,25 +583,111 @@ func (info *sessionInfo) doRecv(from phony.Actor, msg []byte) {
 			onSuccess(key)
 			info.rx += uint64(len(msg))
 			info._resetTimer()
+			if info.pq {
+				if info.lastOpened.IsZero() {
+					// traffic opened under keys from a verified PQ init or ack: a PQ session, both ends
+					info.mgr.pc.pq.markSticky(&info.ed)
+				}
+				info.lastOpened = time.Now()
+			}
 		} else {
 			// Keys somehow became out-of-sync
 			// This seems to happen in some edge cases if a node restarts
 			// Fix by sending a new init
-			info._sendInit()
+			info._sendInitDue()
 		}
 	})
 }
 
 func (info *sessionInfo) _sendInit() {
+	if info.pq {
+		// our newest secret again: a re-init keeps it (the peer may key to it already)
+		own := info.own[0]
+		init := newPQInit(&info.sendPub, &info.nextPub, info.localKeySeq, &own.secret, own.no)
+		info.mgr.sendPQInit(&info.ed, &init, info.peerKey)
+		return
+	}
 	init := newSessionInit(&info.sendPub, &info.nextPub, info.localKeySeq)
 	info.mgr.sendInit(&info.ed, &init)
 }
 
+// _sendInitDue: an init in reply to the peer's traffic, at most once in initReplyInterval
+func (info *sessionInfo) _sendInitDue() {
+	if info.mgr.pc.pq.initReplyDue(&info.ed) {
+		info._sendInit()
+	}
+}
+
 func (info *sessionInfo) _sendAck() {
+	if info.pq {
+		own := info.own[0]
+		ack := newPQInit(&info.sendPub, &info.nextPub, info.localKeySeq, &own.secret, own.no)
+		info.pqAck = &ack // sent again, the same, to a repeat of the init it answers (handleInit)
+		info.mgr.sendPQAck(&info.ed, &ack, info.peerKey)
+		return
+	}
 	init := newSessionInit(&info.sendPub, &info.nextPub, info.localKeySeq)
 	ack := sessionAck{init}
 	info.ack = &ack // sent again, the same, to a repeat of the init it answers (handleInit)
 	info.mgr.sendAck(&info.ed, &ack)
+}
+
+/*********************
+ * PQ session's keys *
+ *********************/
+
+// _newOwnSecret: a new ratchet secret of ours, for the ack about to go. The one before stays (the peer keys to it
+// until the ack comes); one never confirmed is dropped once pqOwnSecretsMax are kept.
+func (info *sessionInfo) _newOwnSecret() {
+	fresh := pqOwnSecret{secret: newRatchetSecret(), no: info.mgr.pc.pq.nextSecretNo()}
+	info.own = append([]pqOwnSecret{fresh}, info.own...)
+	if len(info.own) > pqOwnSecretsMax {
+		info.own = info.own[:pqOwnSecretsMax]
+	}
+}
+
+func (info *sessionInfo) _sendCipher() cipher.AEAD {
+	if info.sendAEAD == nil || info.sendGen != info.keyGen {
+		ourEd := &info.mgr.pc.publicEd
+		info.sendAEAD = pqTrafficKey(&info.sendShared, &info.peerSecret, ourEd, &info.ed, info.localKeySeq, info.remoteKeySeq)
+		info.sendGen = info.keyGen
+	}
+	return info.sendAEAD
+}
+
+// _openPQ opens a PQ packet under the secret of ours its epoch byte names (each kept one with that byte is tried).
+// stale: none kept has it. A packet under a secret confirms it, and starts the time the older ones are kept.
+func (info *sessionInfo) _openPQ(out, msg, ad []byte, nonce uint64, epoch byte, pqCase int, shared *boxShared, fromKeySeq, toKeySeq uint64) ([]byte, bool, bool) {
+	now := time.Now()
+	n := pqNonce(nonce)
+	stale := true
+	for i := range info.own {
+		own := &info.own[i]
+		if byte(own.no) != epoch || (!own.until.IsZero() && now.After(own.until)) {
+			continue
+		}
+		stale = false
+		if own.gen != info.keyGen {
+			own.recv, own.gen = [3]cipher.AEAD{}, info.keyGen
+		}
+		if own.recv[pqCase] == nil {
+			own.recv[pqCase] = pqTrafficKey(shared, &own.secret, &info.ed, &info.mgr.pc.publicEd, fromKeySeq, toKeySeq)
+		}
+		opened, err := own.recv[pqCase].Open(out, n[:], msg, ad)
+		if err != nil {
+			continue
+		}
+		if !own.confirmed {
+			own.confirmed = true
+			for j := i + 1; j < len(info.own); j++ {
+				if info.own[j].until.IsZero() {
+					info.own[j].until = now.Add(sessionTimeout)
+				}
+			}
+		}
+		return opened, true, false
+	}
+	return out, false, stale
 }
 
 /***************

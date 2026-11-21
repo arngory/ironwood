@@ -309,8 +309,54 @@ func (info *sessionInfo) _handleUpdate(init *sessionInit) {
 	info.nextPub, info.nextPriv = newBoxKeys()
 	info.localKeySeq++
 	// Don't roll back sendNonce, just to be extra safe
+	old := info._replay()
 	info._fixShared(0, info.sendNonce)
+	info._carryReplay(&old)
 	info._resetTimer()
+}
+
+// sessionReplay: a session's receive keys and the replay state of each
+type sessionReplay struct {
+	recv, nextSend, nextRecv           boxShared
+	window                             replayWindow
+	nextSendNonce, nextRecvNonce, head uint64
+}
+
+func (info *sessionInfo) _replay() sessionReplay {
+	return sessionReplay{
+		recv: info.recvShared, nextSend: info.nextSendShared, nextRecv: info.nextRecvShared,
+		window: info.recvWindow, nextSendNonce: info.nextSendNonce, nextRecvNonce: info.nextRecvNonce, head: info.recvWindow.head,
+	}
+}
+
+// _carryReplay: after an init or ack of the peer's (_handleUpdate), each receive key that was one before keeps its
+// replay state, or a packet seen under it would open again: an update that keeps the peer's keys moves ours on, and
+// the send keys become receive ones, under which the peer's packets had a high-water mark of their nonces (a key not
+// seen before starts afresh). Upstream starts every key afresh here: a re-init of the peer's with its current keys
+// opened again what it had sent under its next key (review R4-5)
+func (info *sessionInfo) _carryReplay(old *sessionReplay) {
+	seen := func(k *boxShared) (uint64, bool) {
+		switch *k {
+		case old.nextSend:
+			return old.nextSendNonce, true
+		case old.nextRecv:
+			return old.nextRecvNonce, true
+		case old.recv:
+			return old.head, true
+		}
+		return 0, false
+	}
+	if info.recvShared == old.recv {
+		info.recvWindow = old.window
+	} else if n, ok := seen(&info.recvShared); ok {
+		info.recvWindow.resetAt(n)
+	}
+	if n, ok := seen(&info.nextSendShared); ok {
+		info.nextSendNonce = n
+	}
+	if n, ok := seen(&info.nextRecvShared); ok {
+		info.nextRecvNonce = n
+	}
 }
 
 func (info *sessionInfo) doSend(from phony.Actor, msg []byte) {

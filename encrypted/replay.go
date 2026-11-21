@@ -52,6 +52,22 @@ func (w *replayWindow) reset() {
 	w.ring[0] = 1
 }
 
+// resetAt clears the window for a new nonce sequence whose first
+// accepted nonce is floor, and treats every nonce up to floor as seen:
+// the strict high-water mark upstream keeps at that point. A key that
+// becomes the receive key at a ratchet step was already taken up to
+// floor as the next key, under a strict mark, and those packets must
+// not open again under it.
+func (w *replayWindow) resetAt(floor uint64) {
+	w.head = floor
+	for i := range w.ring {
+		w.ring[i] = ^uint64(0)
+	}
+	if bit := floor%replayBlockBits + 1; bit < replayBlockBits {
+		w.ring[(floor/replayBlockBits)&replayBlockMask] = 1<<bit - 1
+	}
+}
+
 // check reports whether nonce may be committed, without recording it.
 // Commit only after the packet has authenticated, so that corrupted
 // packets cannot burn window slots that a retransmission might need.

@@ -35,9 +35,16 @@ var (
 	pqRollbackTries   = 3
 	pqRollbackAfter   = 30 * time.Second
 	pqStaleGrace      = 3 * time.Second
+	pqPendingTimeout  = sessionTimeout  // a PQ init of ours unanswered this long is given up
+	pqUpgradeRetry    = 5 * time.Minute // then, on a classic session, tried again after this
+	pqUnconfirmedMax  = 1024            // PQ sessions no traffic opened under yet
+	pqProbeInterval   = time.Second     // an empty PQ packet, while a classic session beside a PQ one carries traffic
 	pqPeersMax        = 4096
 	pqStickyMax       = 65536
 	pqLogInterval     = time.Minute
+	// PQInfo and PQ inits to keys with no announced ML-KEM key here (unauthenticated asks): at most this many a second
+	// for all of them, and as many at once
+	pqUnsolicitedRate = 20.0
 )
 
 type pqState struct {
@@ -49,16 +56,46 @@ type pqState struct {
 	own   *pqOwnKey // nil until enabled
 	prev  *pqOwnKey // the key before own, taken until own.seq + pqKeyOverlap
 
-	mu     sync.Mutex
-	peers  map[edPub]*list.Element // of *pqPeer, the least used at the back
-	lru    list.List
-	sticky map[edPub]struct{}
+	mu sync.Mutex
+	// the keys announced in signed PQInfos, inits and acks, the least used at the back: an unauthenticated packet
+	// makes no entry here, so it cannot push a real key out
+	peers map[edPub]*list.Element // of *pqPeer
+	lru   list.List
+	// the reply limits of any key, apart: one pushed out loses only when its last reply went
+	limits    map[edPub]*list.Element // of *pqLimit
+	limitsLRU list.List
+	// one bucket for the PQInfos to keys not in peers
+	tokens   float64
+	tokensAt time.Time
+	// keys a session with must be PQ, the least recently confirmed at the back; one with traffic outlives one with
+	// a handshake alone (stickyKey.traffic)
+	sticky       map[edPub]*list.Element // of *stickyKey
+	stickyLRU    list.List
+	stickyLogged time.Time
+	// pqStickyMax, pqPendingTimeout and pqUpgradeRetry, a test's own
+	stickyMax      int
+	pendingTimeout time.Duration
+	upgradeRetry   time.Duration
+}
+
+type stickyKey struct {
+	ed      edPub
+	traffic bool
+}
+
+type pqLimit struct {
+	ed          edPub
+	sentInfoAt  time.Time // our PQInfo to it, last
+	initReplyAt time.Time // our init in reply to its traffic, last
 }
 
 func (s *pqState) init() {
 	s.now = time.Now
 	s.peers = make(map[edPub]*list.Element)
-	s.sticky = make(map[edPub]struct{})
+	s.limits = make(map[edPub]*list.Element)
+	s.sticky = make(map[edPub]*list.Element)
+	s.tokens = pqUnsolicitedRate
+	s.stickyMax, s.pendingTimeout, s.upgradeRetry = pqStickyMax, pqPendingTimeout, pqUpgradeRetry
 }
 
 func (s *pqState) config() *PQConfig {
@@ -84,11 +121,34 @@ func (s *pqState) required(key *edPub) bool {
 	return sticky || (cfg.Required != nil && cfg.Required(key.asKey()))
 }
 
-func (s *pqState) markSticky(key *edPub) {
+// markSticky: key had a PQ session, by a verified ack, or by traffic that opened (traffic). Past pqStickyMax, the
+// least recently marked key with a handshake alone goes first (a full set would otherwise take no new key); each one
+// that goes is a key that can be downgraded again, so it is logged.
+func (s *pqState) markSticky(key *edPub, traffic bool) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if _, ok := s.sticky[*key]; !ok && len(s.sticky) < pqStickyMax {
-		s.sticky[*key] = struct{}{}
+	if e, ok := s.sticky[*key]; ok {
+		s.stickyLRU.MoveToFront(e)
+		e.Value.(*stickyKey).traffic = e.Value.(*stickyKey).traffic || traffic
+		return
+	}
+	s.sticky[*key] = s.stickyLRU.PushFront(&stickyKey{ed: *key, traffic: traffic})
+	if len(s.sticky) <= s.stickyMax {
+		return
+	}
+	victim := s.stickyLRU.Back()
+	for e, n := victim, 0; e != nil && n < 64; e, n = e.Prev(), n+1 {
+		if !e.Value.(*stickyKey).traffic {
+			victim = e
+			break
+		}
+	}
+	gone := victim.Value.(*stickyKey)
+	s.stickyLRU.Remove(victim)
+	delete(s.sticky, gone.ed)
+	if now := s.now(); now.Sub(s.stickyLogged) >= pqLogInterval {
+		s.stickyLogged = now
+		s.logf("PQ: %d keys hold to PQ sessions, the most kept: %x is no longer held to them", s.stickyMax, gone.ed[:8])
 	}
 }
 
@@ -215,12 +275,10 @@ func (pq *sessionPQInfo) decode(from *edPub, data []byte, auth groupAuth) bool {
  *******************/
 
 type pqPeer struct {
-	ed          edPub
-	key         *pqPeerKey // its ML-KEM key in use
-	rollback    *pqPeerKey // one with a lower number, taken once PQ inits under key go unanswered
-	sentInfoAt  time.Time  // our PQInfo to it, last
-	initReplyAt time.Time  // our init in reply to its traffic, last
-	loggedAt    time.Time
+	ed       edPub
+	key      *pqPeerKey // its ML-KEM key in use
+	rollback *pqPeerKey // one with a lower number, taken once PQ inits under key go unanswered
+	loggedAt time.Time
 }
 
 type pqPeerKey struct {
@@ -243,7 +301,8 @@ func newPQPeerKey(ed *edPub, pub *pqPub, seq, notAfter uint64) *pqPeerKey {
 	return k
 }
 
-// _peer: ed's entry, made if absent, as the most recently used. Under s.mu.
+// _peer: ed's entry, made if absent, as the most recently used; only for a key ed signed. Past pqPeersMax, the least
+// used entry of a key not held to PQ goes first. Under s.mu.
 func (s *pqState) _peer(ed *edPub) *pqPeer {
 	if e, ok := s.peers[*ed]; ok {
 		s.lru.MoveToFront(e)
@@ -251,23 +310,59 @@ func (s *pqState) _peer(ed *edPub) *pqPeer {
 	}
 	p := &pqPeer{ed: *ed}
 	s.peers[*ed] = s.lru.PushFront(p)
-	for len(s.peers) > pqPeersMax {
-		last := s.lru.Back()
-		s.lru.Remove(last)
-		delete(s.peers, last.Value.(*pqPeer).ed)
+	if len(s.peers) > pqPeersMax {
+		victim := s.lru.Back()
+		for e, n := victim, 0; e != nil && n < 64; e, n = e.Prev(), n+1 {
+			if _, held := s.sticky[e.Value.(*pqPeer).ed]; !held {
+				victim = e
+				break
+			}
+		}
+		s.lru.Remove(victim)
+		delete(s.peers, victim.Value.(*pqPeer).ed)
 	}
 	return p
+}
+
+// _limit: ed's reply limits, made if absent. Under s.mu.
+func (s *pqState) _limit(ed *edPub) *pqLimit {
+	if e, ok := s.limits[*ed]; ok {
+		s.limitsLRU.MoveToFront(e)
+		return e.Value.(*pqLimit)
+	}
+	l := &pqLimit{ed: *ed}
+	s.limits[*ed] = s.limitsLRU.PushFront(l)
+	if len(s.limits) > pqPeersMax {
+		last := s.limitsLRU.Back()
+		s.limitsLRU.Remove(last)
+		delete(s.limits, last.Value.(*pqLimit).ed)
+	}
+	return l
+}
+
+// _token: one of the bucket for unauthenticated asks, if there is one. Under s.mu.
+func (s *pqState) _token(now time.Time) bool {
+	if !s.tokensAt.IsZero() {
+		s.tokens = min(pqUnsolicitedRate, s.tokens+now.Sub(s.tokensAt).Seconds()*pqUnsolicitedRate)
+	}
+	s.tokensAt = now
+	if s.tokens < 1 {
+		return false
+	}
+	s.tokens--
+	return true
 }
 
 func (s *pqState) _live(k *pqPeerKey, slack time.Duration) bool {
 	return k != nil && s.now().Unix() <= int64(k.notAfter)+int64(slack/time.Second)
 }
 
-// usableKey: ed's ML-KEM key to seal to, nil if none is known or it is out of time
+// usableKey: ed's ML-KEM key to seal to, nil if none is known or it is out of time; the entry counts as used
 func (s *pqState) usableKey(ed *edPub) *pqPeerKey {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if e, ok := s.peers[*ed]; ok {
+		s.lru.MoveToFront(e)
 		if p := e.Value.(*pqPeer); s._live(p.key, pqClockSlack) {
 			return p.key
 		}
@@ -283,8 +378,11 @@ func (s *pqState) usableKey(ed *edPub) *pqPeerKey {
 func (s *pqState) accept(ed *edPub, pub *pqPub, seq, notAfter uint64) (accepted, updated bool) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	p := s._peer(ed)
 	now := s.now()
+	if !s.plausible(seq, notAfter) {
+		return false, false
+	}
+	p := s._peer(ed)
 	if now.Unix() > int64(notAfter)+int64(pqClockSlack/time.Second) {
 		if now.Sub(p.loggedAt) >= pqLogInterval {
 			p.loggedAt = now
@@ -305,6 +403,31 @@ func (s *pqState) accept(ed *edPub, pub *pqPub, seq, notAfter uint64) (accepted,
 		p.rollback = newPQPeerKey(ed, pub, seq, notAfter)
 	}
 	return false, false
+}
+
+// plausible: a key numbered no further ahead than the clocks can be apart, and valid no longer than any key is made
+// for. One beyond either, replayed, would take the table's place of every real key after it (a lower number is a
+// rollback, kept aside).
+func (s *pqState) plausible(seq, notAfter uint64) bool {
+	now := uint64(s.now().Unix())
+	return seq <= now+uint64(pqClockSlack/time.Second) && notAfter >= seq && notAfter-seq <= uint64(pqKeyValidity/time.Second)
+}
+
+// logStripped: ed announced an ML-KEM key, and its PQ session did not come up (what: how): once in pqLogInterval
+func (s *pqState) logStripped(ed *edPub, what string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	e, ok := s.peers[*ed]
+	if !ok {
+		return
+	}
+	p, now := e.Value.(*pqPeer), s.now()
+	if now.Sub(p.loggedAt) < pqLogInterval {
+		return
+	}
+	p.loggedAt = now
+	s.logf("PQ: %x announced an ML-KEM key, and %s in %s: the session stays classic (PQ packets lost or dropped on the way?)",
+		ed[:8], what, s.pendingTimeout)
 }
 
 // takeRollback: the lower-numbered key kept aside for ed, now in use, if it is still within its notAfter
@@ -328,15 +451,19 @@ func (s *pqState) takeRollback(ed *edPub) *pqPeerKey {
 	return k
 }
 
-// infoDue: our PQInfo may go to ed now (at most once in pqInfoInterval); counts it as sent
+// infoDue: our PQInfo may go to ed now (at most once in pqInfoInterval; to a key with no entry in peers, only with a
+// token of the bucket for all such keys); counts it as sent
 func (s *pqState) infoDue(ed *edPub) bool {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	p, now := s._peer(ed), s.now()
-	if !p.sentInfoAt.IsZero() && now.Sub(p.sentInfoAt) < pqInfoInterval {
+	l, now := s._limit(ed), s.now()
+	if !l.sentInfoAt.IsZero() && now.Sub(l.sentInfoAt) < pqInfoInterval {
 		return false
 	}
-	p.sentInfoAt = now
+	if _, known := s.peers[*ed]; !known && !s._token(now) {
+		return false
+	}
+	l.sentInfoAt = now
 	return true
 }
 
@@ -345,10 +472,10 @@ func (s *pqState) infoDue(ed *edPub) bool {
 func (s *pqState) initReplyDue(ed *edPub) bool {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	p, now := s._peer(ed), s.now()
-	if !p.initReplyAt.IsZero() && now.Sub(p.initReplyAt) < initReplyInterval {
+	l, now := s._limit(ed), s.now()
+	if !l.initReplyAt.IsZero() && now.Sub(l.initReplyAt) < initReplyInterval {
 		return false
 	}
-	p.initReplyAt = now
+	l.initReplyAt = now
 	return true
 }

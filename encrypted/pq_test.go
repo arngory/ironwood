@@ -11,6 +11,7 @@ import (
 
 	"github.com/Arceliar/phony"
 
+	"github.com/Arceliar/ironwood/network"
 	"github.com/Arceliar/ironwood/types"
 )
 
@@ -24,7 +25,13 @@ type pqNode struct {
 	heard chan string
 	// dropPQ: the packets of types 0x10-0x13 this node sends are lost (a link that drops them)
 	dropPQ atomic.Bool
-	sent   [256]atomic.Int64 // session packets sent, by type
+	// dropType: the packets of a type this node sends are lost
+	dropType [256]atomic.Bool
+	// tap sees each session packet this node sends, may change it, and drops it by returning true
+	tap  atomic.Pointer[func(data []byte) bool]
+	sent [256]atomic.Int64 // session packets sent, by type
+	// empty: reads of nothing (a probe of PQ sessions is not a message)
+	empty atomic.Int64
 }
 
 func (n *pqNode) key() (k edPub) {
@@ -32,10 +39,10 @@ func (n *pqNode) key() (k edPub) {
 	return
 }
 
-func newPQNode(t *testing.T, cfg PQConfig) *pqNode {
+func newPQNode(t *testing.T, cfg PQConfig, options ...network.Option) *pqNode {
 	t.Helper()
 	pub, priv, _ := ed25519.GenerateKey(nil)
-	pc, err := NewPacketConn(priv)
+	pc, err := NewPacketConn(priv, options...)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -43,7 +50,10 @@ func newPQNode(t *testing.T, cfg PQConfig) *pqNode {
 	n := &pqNode{pc: pc, pub: pub, heard: make(chan string, 64)}
 	pc.testDrop = func(data []byte) bool {
 		n.sent[data[0]].Add(1)
-		return n.dropPQ.Load() && data[0] >= sessionTypePQInfo && data[0] <= sessionTypePQTraffic
+		if tap := n.tap.Load(); tap != nil && (*tap)(data) {
+			return true
+		}
+		return n.dropType[data[0]].Load() || (n.dropPQ.Load() && data[0] >= sessionTypePQInfo && data[0] <= sessionTypePQTraffic)
 	}
 	pc.SetPQ(cfg)
 	return n
@@ -59,11 +69,14 @@ func linkPQ(t *testing.T, a, b *pqNode) {
 	warmPaths(t, a.pc, b.pc, a.pub, b.pub)
 	for _, n := range []*pqNode{a, b} {
 		go func(n *pqNode) {
-			buf := make([]byte, 128)
+			buf := make([]byte, n.pc.MTU()+1)
 			for {
 				m, _, err := n.pc.ReadFrom(buf)
 				if err != nil {
 					return
+				}
+				if m == 0 {
+					n.empty.Add(1)
 				}
 				select {
 				case n.heard <- string(buf[:m]):
@@ -89,14 +102,25 @@ func hears(from, to *pqNode, msg string, d time.Duration) bool {
 	return false
 }
 
-// session: n's session with peer: none, classic or PQ
+// session: n's session with peer: none, classic, PQ, or PQ with nothing opened under it yet (traffic still by the
+// classic session beside it, for a key that may be classic)
 func session(n, peer *pqNode) string {
 	for _, s := range n.pc.Debug.GetSessions() {
 		if bytes.Equal(s.Key, peer.pub) {
-			if s.PQ {
-				return "pq"
+			if !s.PQ {
+				return "classic"
 			}
-			return "classic"
+			k := peer.key()
+			var fallback bool
+			phony.Block(&n.pc.sessions, func() {
+				if info := n.pc.sessions.sessions[k]; info != nil {
+					fallback = info.fallback != nil && !info.confirmed.Load()
+				}
+			})
+			if fallback {
+				return "pq, unconfirmed"
+			}
+			return "pq"
 		}
 	}
 	return "none"
@@ -121,14 +145,22 @@ func sticky(n, peer *pqNode) bool {
 	return ok
 }
 
-// dropSessions forgets n's sessions, as their timeout would
+// dropSessions forgets n's sessions, as their timeout would. A session's timer is its own actor's: stopped there.
 func dropSessions(n *pqNode) {
+	var dropped []*sessionInfo
 	phony.Block(&n.pc.sessions, func() {
 		for k, s := range n.pc.sessions.sessions {
-			s.timer.Stop()
+			dropped = append(dropped, s)
 			delete(n.pc.sessions.sessions, k)
 		}
 	})
+	for _, s := range dropped {
+		phony.Block(s, func() {
+			if s.timer != nil {
+				s.timer.Stop()
+			}
+		})
+	}
 }
 
 var pqOn = PQConfig{Enabled: true}
@@ -395,14 +427,22 @@ func TestPQInfoRules(t *testing.T) {
 	if ok, _ := pc.pq.accept(&peer, &k3, n-20, n-day); ok || pc.pq.takeRollback(&peer) != nil {
 		t.Fatal("a lower-numbered key past its own notAfter kept for rollback")
 	}
-	// a new number, two days past its notAfter by our clock (ahead): taken (the slack)
-	if ok, _ := pc.pq.accept(&peer, &k3, n+100, n-2*day); !ok {
+	// a first key of another peer whose clock is behind: two days past its notAfter by ours, taken (the slack)
+	behind, further := newPeerEd(t), newPeerEd(t)
+	if ok, _ := pc.pq.accept(&behind, &k3, n-4*day, n-2*day); !ok {
 		t.Fatal("a key two days out of time by our clock refused (the slack)")
 	}
 	// four days past: refused, with a line in the log
 	k4 := newPQKeyPub(t)
-	if ok, _ := pc.pq.accept(&peer, &k4, n+200, n-4*day); ok {
+	if ok, _ := pc.pq.accept(&further, &k4, n-6*day, n-4*day); ok {
 		t.Fatal("a key four days out of time taken")
+	}
+	// numbered further ahead than the slack, valid for longer than a key is made for, or ending before its number:
+	// refused, and not kept aside either (a PQInfo of it replayed would push the real keys out)
+	for _, bad := range [][2]uint64{{n + 4*day, n + 6*day}, {n + 10, n + 10 + 3*day}, {n + 10, n + 5}} {
+		if ok, _ := pc.pq.accept(&peer, &k4, bad[0], bad[1]); ok || pc.pq.takeRollback(&peer) != nil {
+			t.Fatalf("a key numbered %d, valid until %d (now %d) taken", bad[0], bad[1], n)
+		}
 	}
 	refusals := 0
 	for _, line := range logged {
@@ -413,6 +453,17 @@ func TestPQInfoRules(t *testing.T) {
 	if refusals != 1 {
 		t.Fatalf("log lines on a refusal by time: %d", refusals)
 	}
+}
+
+// newPeerEd: the ed25519 key of a node that is not there
+func newPeerEd(t *testing.T) (k edPub) {
+	t.Helper()
+	pub, _, err := ed25519.GenerateKey(nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	copy(k[:], pub)
+	return
 }
 
 func newPQKeyPub(t *testing.T) (pub pqPub) {
@@ -431,6 +482,7 @@ func TestPQDirectionKeys(t *testing.T) {
 	x[0], y[0] = 1, 2
 	xToY := pqTrafficKey(&shared, &secretY, &x, &y, 3, 4)
 	xToYatY := pqTrafficKey(&shared, &secretY, &x, &y, 3, 4)
+	otherSecret := pqTrafficKey(&shared, &secretX, &x, &y, 3, 4)
 	yToX := pqTrafficKey(&shared, &secretX, &y, &x, 4, 3)
 	sameSecretOtherWay := pqTrafficKey(&shared, &secretY, &y, &x, 4, 3)
 	nonce := pqNonce(1)
@@ -441,6 +493,9 @@ func TestPQDirectionKeys(t *testing.T) {
 	}
 	if _, err := yToX.Open(nil, nonce[:], sealed, header); err == nil {
 		t.Fatal("a packet opened with the other direction's key")
+	}
+	if _, err := otherSecret.Open(nil, nonce[:], sealed, header); err == nil {
+		t.Fatal("a packet opened under another ratchet secret: the secret is not in the key")
 	}
 	if _, err := sameSecretOtherWay.Open(nil, nonce[:], sealed, header); err == nil {
 		t.Fatal("the label did not tell the directions apart")

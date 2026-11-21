@@ -91,18 +91,25 @@ func (pc *PacketConn) WriteTo(p []byte, addr net.Addr) (n int, err error) {
 
 // MTU returns the maximum transmission unit of the PacketConn, i.e. maximum safe message size to send over the network.
 // It leaves room for the larger of the two traffic headers, the classic and the PQ one (a byte more), so that it
-// does not change when PQ sessions are turned on.
+// does not change when PQ sessions are turned on. A peer without PQ sessions leaves room for the classic header
+// alone: its messages can be a byte longer than this, and a reader with a buffer of MTU() bytes cuts them; read with
+// MTU()+1. (Yggdrasil's own messages stay well below either.)
 func (pc *PacketConn) MTU() uint64 {
 	return pc.PacketConn.MTU() - max(sessionTrafficOverhead, pqTrafficOverhead)
 }
 
-// SetPQ turns the hybrid post-quantum sessions on or off, and sets which keys must have them (PQConfig). Sessions
-// that are up stay as they are.
+// SetPQ turns the hybrid post-quantum sessions on or off, and sets which keys must have them (PQConfig). Turned off,
+// the PQ sessions that are up are dropped (their 0x13 would still go out, and the peer's be dropped here) and the
+// next packet to each peer starts a classic session; a peer that holds this key to PQ (it had a PQ session with it)
+// refuses that until it forgets the key. Turned on, or with another Required, classic sessions that are up stay.
 func (pc *PacketConn) SetPQ(cfg PQConfig) {
 	if cfg.Enabled {
 		pc.pqOwn() // the process's ML-KEM key, made now rather than on the first contact
 	}
 	pc.pq.cfg.Store(&cfg)
+	if !cfg.Enabled {
+		pc.sessions.dropPQ()
+	}
 }
 
 // writeRaw sends a session packet to dest below the sessions.

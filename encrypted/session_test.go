@@ -194,6 +194,80 @@ func TestReplayedInitKeepsKeys(t *testing.T) {
 	}
 }
 
+// TestReorderedTrafficArrives: two packets of a session swapped on the way (the first held back until the second has
+// gone) both arrive. A strict high-water mark of nonces lost the first, an older nonce than one already taken; the
+// replay window takes it, once.
+func TestReorderedTrafficArrives(t *testing.T) {
+	pubA, privA, _ := ed25519.GenerateKey(nil)
+	pubB, privB, _ := ed25519.GenerateKey(nil)
+	a, _ := NewPacketConn(privA)
+	defer a.Close()
+	b, _ := NewPacketConn(privB)
+	defer b.Close()
+	cA, cB := newLossyLink(nil)
+	defer cA.Close()
+	go a.HandleConn(pubB, cA, 0)
+	go b.HandleConn(pubA, cB, 0)
+	addrB := types.Addr(pubB)
+	warmPaths(t, a, b, pubA, pubB)
+	go func() {
+		buf := make([]byte, 64)
+		for {
+			if _, _, err := a.ReadFrom(buf); err != nil {
+				return
+			}
+		}
+	}()
+	heard := make(chan string, 16)
+	go func() {
+		buf := make([]byte, 64)
+		for {
+			n, _, err := b.ReadFrom(buf)
+			if err != nil {
+				return
+			}
+			heard <- string(buf[:n])
+		}
+	}()
+	// the handshake first
+	for deadline := time.Now().Add(5 * time.Second); ; {
+		a.WriteTo([]byte("hello"), addrB)
+		select {
+		case <-heard:
+		case <-time.After(250 * time.Millisecond):
+			if time.Now().After(deadline) {
+				t.Fatal("no handshake in 5 s")
+			}
+			continue
+		}
+		break
+	}
+	for len(heard) > 0 {
+		<-heard
+	}
+
+	cA.swap.Store(true)
+	a.WriteTo([]byte("one"), addrB)
+	a.WriteTo([]byte("two"), addrB)
+	got := map[string]int{}
+	for timeout := time.After(3 * time.Second); got["one"] == 0 || got["two"] == 0; {
+		select {
+		case msg := <-heard:
+			got[msg]++
+		case <-timeout:
+			t.Fatalf("heard %v: the packet held back was lost", got)
+		}
+	}
+	// and once each: the window takes no nonce twice
+	time.Sleep(200 * time.Millisecond)
+	for len(heard) > 0 {
+		got[<-heard]++
+	}
+	if got["one"] != 1 || got["two"] != 1 {
+		t.Fatalf("heard %v", got)
+	}
+}
+
 // warmPaths: a path each way, without a session: packets below the sessions, ignored by them.
 func warmPaths(t *testing.T, a, b *PacketConn, pubA, pubB ed25519.PublicKey) {
 	t.Helper()
@@ -233,6 +307,9 @@ type lossyConn struct {
 	// while capture is set, the traffic frames written are kept too (captured), for replay
 	capture  atomic.Bool
 	captured [][]byte
+	// once swap is set, the next traffic frame is held back and goes after the one that follows it
+	swap atomic.Bool
+	held []byte
 }
 
 // replay writes a frame again, as the network would if it duplicated it (or someone on the path replayed it).
@@ -293,7 +370,15 @@ func (c *lossyConn) Write(p []byte) (int, error) {
 		if traffic && c.capture.Load() {
 			c.captured = append(c.captured, append([]byte(nil), frame...))
 		}
-		if !(traffic && c.drop != nil && c.drop.Load()) {
+		switch {
+		case traffic && c.drop != nil && c.drop.Load():
+		case traffic && c.swap.Load() && c.held == nil:
+			c.held = append([]byte(nil), frame...)
+		case traffic && c.held != nil:
+			out = append(append(out, frame...), c.held...)
+			c.held = nil
+			c.swap.Store(false)
+		default:
 			out = append(out, frame...)
 		}
 		c.pending = c.pending[n+int(size):]

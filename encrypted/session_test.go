@@ -504,3 +504,69 @@ func TestShortTrafficDropped(t *testing.T) {
 		}
 	}
 }
+
+// BenchmarkClassicTraffic: a classic session (PQ off), one message at a time from A to B, end to end: its
+// allocations a message are base's (60 on 898a313).
+func BenchmarkClassicTraffic(b *testing.B) {
+	pubA, privA, _ := ed25519.GenerateKey(nil)
+	pubB, privB, _ := ed25519.GenerateKey(nil)
+	a, _ := NewPacketConn(privA)
+	defer a.Close()
+	c, _ := NewPacketConn(privB)
+	defer c.Close()
+	cA, cB := newLossyLink(nil)
+	defer cA.Close()
+	go a.HandleConn(pubB, cA, 0)
+	go c.HandleConn(pubA, cB, 0)
+	hasPath := func(pc *PacketConn, key ed25519.PublicKey) bool {
+		for _, p := range pc.PacketConn.Debug.GetPaths() {
+			if bytes.Equal(p.Key, key) {
+				return true
+			}
+		}
+		return false
+	}
+	for !hasPath(a, pubB) || !hasPath(c, pubA) {
+		a.PacketConn.WriteTo([]byte{0}, types.Addr(pubB))
+		c.PacketConn.WriteTo([]byte{0}, types.Addr(pubA))
+		time.Sleep(50 * time.Millisecond)
+	}
+	got := make(chan struct{}, 1024)
+	go func() {
+		buf := make([]byte, 4096)
+		for {
+			if _, _, err := c.ReadFrom(buf); err != nil {
+				return
+			}
+			got <- struct{}{}
+		}
+	}()
+	go func() {
+		buf := make([]byte, 4096)
+		for {
+			if _, _, err := a.ReadFrom(buf); err != nil {
+				return
+			}
+		}
+	}()
+	msg := make([]byte, 1000)
+	addrB := types.Addr(pubB)
+	for ready := false; !ready; {
+		a.WriteTo(msg, addrB)
+		select {
+		case <-got:
+			ready = true
+		case <-time.After(100 * time.Millisecond):
+		}
+	}
+	time.Sleep(200 * time.Millisecond)
+	for len(got) > 0 {
+		<-got
+	}
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		a.WriteTo(msg, addrB)
+		<-got
+	}
+}

@@ -42,8 +42,11 @@ type sessionManager struct {
 	buffers        map[edPub]*sessionBuffer
 	pqPending      map[edPub]*pqPending
 	pqRetry        map[edPub]bool         // an upgrade to PQ to try again (_upgradeLater)
+	pqAwait        map[edPub]bool         // a PQ init of the peer's awaited (_awaitPQInit)
 	pqUnconfirmed  map[edPub]*sessionInfo // PQ sessions no traffic may have opened under yet (_countUnconfirmed)
+	pqCount        atomic.Int64           // the PQ sessions in sessions (_put); read by PQSessionCount
 	unconfirmedMax int                    // pqUnconfirmedMax, a test's own
+	idleTimeout    time.Duration          // sessionTimeout, a test's own
 }
 
 func (mgr *sessionManager) init(pc *PacketConn) {
@@ -52,8 +55,50 @@ func (mgr *sessionManager) init(pc *PacketConn) {
 	mgr.buffers = make(map[edPub]*sessionBuffer)
 	mgr.pqPending = make(map[edPub]*pqPending)
 	mgr.pqRetry = make(map[edPub]bool)
+	mgr.pqAwait = make(map[edPub]bool)
 	mgr.pqUnconfirmed = make(map[edPub]*sessionInfo)
 	mgr.unconfirmedMax = pqUnconfirmedMax
+	mgr.idleTimeout = sessionTimeout
+}
+
+// _put: info as the session with ed, nil for none; the count of PQ sessions follows
+func (mgr *sessionManager) _put(ed edPub, info *sessionInfo) {
+	if old := mgr.sessions[ed]; old != nil && old.pq {
+		mgr.pqCount.Add(-1)
+	}
+	if info == nil {
+		delete(mgr.sessions, ed)
+		return
+	}
+	mgr.sessions[ed] = info
+	if info.pq {
+		mgr.pqCount.Add(1)
+	}
+}
+
+// _restoreClassic: the classic session beside the PQ one info takes its place, with a timer of its own again (its
+// own may have fired while the PQ one held the table, and done nothing: without a new one it would never go)
+func (mgr *sessionManager) _restoreClassic(info *sessionInfo) {
+	fb := info.fallback
+	info.fallback = nil
+	mgr._put(info.ed, fb)
+	if mgr.pqUnconfirmed[info.ed] == info {
+		delete(mgr.pqUnconfirmed, info.ed)
+	}
+	fb.Act(mgr, fb._resetTimer)
+}
+
+// _expire: info's timer fired, nothing sent or received under it in idleTimeout
+func (mgr *sessionManager) _expire(info *sessionInfo) {
+	if mgr.sessions[info.ed] != info {
+		return
+	}
+	if info.fallback != nil && !info.confirmed.Load() && !mgr.pc.pq.required(&info.ed) {
+		// a PQ session nothing opened under, of a key that may be classic: the classic one beside it stays
+		mgr._restoreClassic(info)
+		return
+	}
+	mgr._put(info.ed, nil)
 }
 
 // dropPQ forgets the PQ sessions and the PQ inits under way (PQ turned off): the next packet starts a classic one
@@ -67,10 +112,12 @@ func (mgr *sessionManager) dropPQ() {
 		}
 		for k, info := range mgr.sessions {
 			switch {
-			case info.pq && info.fallback != nil:
-				mgr.sessions[k] = info.fallback // the classic session beside it goes on
+			case info.pq && info.fallback != nil && !info.confirmed.Load():
+				// the classic session beside it goes on: the peer may still use it. Beside a confirmed one it is stale
+				// (the peer left it), and goes with it
+				mgr._restoreClassic(info)
 			case info.pq:
-				delete(mgr.sessions, k)
+				mgr._put(k, nil)
 			}
 		}
 		clear(mgr.pqUnconfirmed)
@@ -83,7 +130,7 @@ func (mgr *sessionManager) _newSession(ed *edPub, recv, send boxPub, seq uint64)
 		info.mgr = mgr
 		info._resetTimer()
 	})
-	mgr.sessions[info.ed] = info
+	mgr._put(info.ed, info)
 	return info
 }
 
@@ -136,11 +183,23 @@ func (mgr *sessionManager) handleData(from phony.Actor, pub *edPub, data []byte)
 			switch {
 			case len(data) != sessionInitSize:
 				// not an init: no answer to it
-			case mgr.pqRefusesClassic(pub):
+			case mgr.pc.pq.required(pub):
 				// it must be PQ: our PQInfo, so that it can start a PQ init if it has them
+				mgr._logClassicAsked(pub, data)
 				mgr._sendPQInfoDue(pub)
 			default:
 				if init := new(sessionInit); init.decrypt(&mgr.pc.secretBox, pub, data, mgr.pc.groupAuth) {
+					if info := mgr.sessions[*pub]; pq && info != nil && info.pq && info.confirmed.Load() {
+						if init.seq <= info.initSeq {
+							// older than the PQ session (replayed?): refused, as classic to a PQ session is
+							mgr._sendPQInfoDue(pub)
+							break
+						}
+						// a new classic init, signed, from a key not held to PQ (or no longer: its notAfter passed): the
+						// peer has no PQ session now (PQ turned off, or a restart without it). The PQ session goes, or
+						// it would refuse the peer's classic for as long as our traffic keeps it up
+						mgr._put(*pub, nil)
+					}
 					mgr._handleInit(pub, init)
 				}
 			}
@@ -208,21 +267,49 @@ func (mgr *sessionManager) _handleTraffic(pub *edPub, msg []byte) {
 	if len(msg) < sessionTrafficOverheadMin {
 		// too short to be traffic: no answer to it (an init or a PQInfo many times its size)
 		freeBytes(msg)
-	} else if info := mgr.sessions[*pub]; info != nil {
-		if info.pq && info.fallback != nil && !info.confirmed.Load() {
+		return
+	}
+	if info := mgr.sessions[*pub]; info != nil {
+		required := mgr.pc.pq.required(pub)
+		switch {
+		case info.pq && info.fallback != nil && !info.confirmed.Load() && !required:
 			// to the classic session beside a PQ one nothing opened under yet: the peer may not have the PQ one
 			info.fallback.doRecv(mgr, msg)
-		} else {
-			// a PQ session drops it (a classic packet sent before the PQ session took the classic one's place)
+			return
+		case info.pq:
+			if info.fallback != nil && required {
+				// a key that must be PQ now (Required, or held to PQ): the classic session beside goes, not restored
+				info.fallback = nil
+				mgr._logClassicAsked(pub, nil)
+			}
+			// The peer sends by its classic session still: it has had no PQ packet of ours (we sent none since our
+			// ack, which was lost), or went back to classic. Dropped, and an empty PQ packet in reply, at most once in
+			// initReplyInterval: it confirms the peer's PQ session, or has the peer start a PQ init (_handlePQTraffic)
+			if mgr.pc.pq.initReplyDue(pub) {
+				info.doSend(mgr, allocBytes(0))
+			}
+			freeBytes(msg)
+			return
+		case !required:
 			info.doRecv(mgr, msg)
+			return
 		}
-	} else if mgr.pc.pq.required(pub) {
-		mgr._sendPQInfoDue(pub)
-		freeBytes(msg)
-	} else if !mgr.pc.pq.initReplyDue(pub) {
+		// a classic session of a key that must be PQ now (Required changed): it goes, as on our next write
+		mgr._put(*pub, nil)
+	}
+	switch {
+	case mgr.pc.pq.required(pub):
+		mgr._logClassicAsked(pub, nil)
+		// a PQ init of ours, its ML-KEM key known (a peer held to PQ that went back to classic, or lost its PQ
+		// session: our PQInfo alone would not bring one, the peer may have the higher key and nothing waiting)
+		if key := mgr.pc.pq.usableKey(pub); key == nil {
+			mgr._sendPQInfoDue(pub)
+		} else if mgr.pqPending[*pub] == nil && mgr.pc.pq.initReplyDue(pub) && mgr.pc.pq.tokenDue() {
+			mgr._startPQ(pub, key)
+		}
+	case !mgr.pc.pq.initReplyDue(pub):
 		// one init in reply per initReplyInterval: every packet of a stream would send one
-		freeBytes(msg)
-	} else {
+	default:
 		// We don't know that the node really exists, it could be spoofed/replay
 		// So we don't want to save session or a buffer based on this node
 		// So we send an init with keys we'll forget
@@ -231,17 +318,42 @@ func (mgr *sessionManager) _handleTraffic(pub *edPub, msg []byte) {
 		nextPub, _ := newBoxKeys()
 		init := newSessionInit(&currentPub, &nextPub, 0)
 		mgr.sendInit(pub, &init)
-		freeBytes(msg)
+	}
+	freeBytes(msg)
+}
+
+// _logClassicAsked: a key held to PQ (a PQ session was up with it) sent a classic init (init, checked first) or
+// classic traffic (init nil; nothing can check it): a line in the log, one a pqLogInterval for all keys. It may have
+// turned its PQ sessions off, or restarted without them: it is refused until its stickiness ends.
+func (mgr *sessionManager) _logClassicAsked(pub *edPub, init []byte) {
+	s := &mgr.pc.pq
+	if !s.logDue(&s.askedLogged) || !s.isSticky(pub) {
+		return
+	}
+	what := "classic traffic"
+	if init != nil {
+		if !new(sessionInit).decrypt(&mgr.pc.secretBox, pub, init, mgr.pc.groupAuth) {
+			return
+		}
+		what = "a classic init"
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if k := s._held(pub); k != nil {
+		s._logEvery(&s.askedLogged, "PQ: %s from %x, held to PQ sessions (one was up with it): refused until %s (the end of its ML-KEM key); has it turned PQ sessions off?",
+			what, pub[:8], time.Unix(int64(k.notAfter), 0).UTC().Format(time.RFC3339))
 	}
 }
 
 func (mgr *sessionManager) writeTo(toKey edPub, msg []byte) {
 	// WARNING: unsafe to call from within an actor, must only be exposed over the PacketConn functions (which are, themselves, unsafe for actors to call in most cases, since they may block)
 	phony.Block(mgr, func() {
+		// a copy: the address of toKey itself would have the closure take it by reference (an allocation a write)
+		toKey := toKey
 		info := mgr.sessions[toKey]
 		if info != nil && !info.pq && mgr.pc.pq.required(&toKey) {
 			// the key became one that must be PQ (its node announced it): the classic session goes
-			delete(mgr.sessions, toKey)
+			mgr._put(toKey, nil)
 			info = nil
 		}
 		if info != nil && info.pq && info.fallback != nil {
@@ -274,12 +386,18 @@ func (mgr *sessionManager) _bufferAndInit(toKey edPub, msg []byte) {
 		buf.currentPriv = currentPriv
 		buf.nextPriv = nextPriv
 		buf.timer = time.AfterFunc(0, func() {})
+		buf.since = time.Now()
 		mgr.buffers[toKey] = buf
 	}
 	buf.data = msg
 	buf.timer.Stop()
 	if !mgr.pc.pq.required(&toKey) {
 		mgr.sendInit(&toKey, &buf.init)
+	} else if mgr.pc.pq.usableKey(&toKey) == nil && time.Since(buf.since) >= mgr.pc.pq.pendingTimeout {
+		// it must be PQ, and no PQInfo of it came: no session. A line in the log, or nothing would tell why
+		s := &mgr.pc.pq
+		s.logEvery(&s.noPQLogged, "PQ: %x must be PQ, and no PQInfo of it came in %s: no session (it has no PQ sessions, or PQInfos are dropped on the way?)",
+			toKey[:8], s.pendingTimeout)
 	}
 	mgr._maybeStartPQ(&toKey)
 	buf.timer = time.AfterFunc(sessionTimeout, func() {
@@ -292,13 +410,21 @@ func (mgr *sessionManager) _bufferAndInit(toKey edPub, msg []byte) {
 	})
 }
 
+// sendInit and sendAck send no classic init or ack to a key that must be PQ (the classic session beside a PQ one
+// would, on traffic it cannot open)
 func (mgr *sessionManager) sendInit(dest *edPub, init *sessionInit) {
+	if mgr.pc.pq.required(dest) {
+		return
+	}
 	if bs, err := init.encrypt(&mgr.pc.secretEd, dest, mgr.pc.groupAuth); err == nil {
 		mgr.pc.writeRaw(bs, dest)
 	}
 }
 
 func (mgr *sessionManager) sendAck(dest *edPub, ack *sessionAck) {
+	if mgr.pc.pq.required(dest) {
+		return
+	}
 	if bs, err := ack.encrypt(&mgr.pc.secretEd, dest, mgr.pc.groupAuth); err == nil {
 		mgr.pc.writeRaw(bs, dest)
 	}
@@ -350,11 +476,16 @@ type sessionInfo struct {
 	pqAckData    []byte  // it as sent: a repeat gets these bytes, not a new sealing
 	reAckAt      time.Time
 	lastOpened   time.Time
+	stickyAt     time.Time   // the key marked sticky by traffic of this session, last (pq.now)
 	confirmed    atomic.Bool // a PQ packet opened (read by the manager)
+	adBuf        [32]byte    // a PQ packet's header as associated data (Seal: not where the output goes)
+	nonceBuf     [pqNonceSize]byte
 	// the manager's: the classic session a PQ one of a key that may be classic replaced, kept and used until a PQ
-	// packet opens (the peer may never have had the ack, or PQ packets be dropped on the way); a probe of ours, last
+	// packet opens (the peer may never have had the ack, or PQ packets be dropped on the way); a probe of ours, last;
+	// the newest seq of a PQ init or ack passed to this session
 	fallback *sessionInfo
 	probeAt  time.Time
+	initSeq  uint64
 }
 
 // pqOwnSecret is a ratchet secret of ours a peer may key its traffic to us with: the newest until a packet under it
@@ -404,16 +535,9 @@ func (info *sessionInfo) _resetTimer() {
 	if info.timer != nil {
 		info.timer.Stop()
 	}
-	info.timer = time.AfterFunc(sessionTimeout, func() {
+	info.timer = time.AfterFunc(info.mgr.idleTimeout, func() {
 		info.mgr.Act(nil, func() {
-			if oldInfo := info.mgr.sessions[info.ed]; oldInfo == info {
-				if info.fallback != nil && !info.confirmed.Load() {
-					// a PQ session nothing opened under: the classic one beside it stays
-					info.mgr.sessions[info.ed] = info.fallback
-				} else {
-					delete(info.mgr.sessions, info.ed)
-				}
-			}
+			info.mgr._expire(info)
 		})
 	})
 }
@@ -519,10 +643,9 @@ func (info *sessionInfo) doSend(from phony.Actor, msg []byte) {
 		tmp = append(tmp, msg...)
 		if info.pq {
 			// the whole header is associated data: no number in it can be changed on the way
-			var header [32]byte
-			ad := header[:copy(header[:], bs)]
-			nonce := pqNonce(info.sendNonce)
-			bs = info._sendCipher().Seal(bs, nonce[:], tmp, ad)
+			ad := info.adBuf[:copy(info.adBuf[:], bs)]
+			info.nonceBuf = pqNonce(info.sendNonce)
+			bs = info._sendCipher().Seal(bs, info.nonceBuf[:], tmp, ad)
 		} else {
 			bs = boxSeal(bs, tmp, info.sendNonce, &info.sendShared)
 		}
@@ -571,8 +694,7 @@ func (info *sessionInfo) doRecv(from phony.Actor, msg []byte) {
 			epoch = msg[offset]
 			offset++
 		}
-		var header [32]byte
-		ad := header[:copy(header[:], orig[:offset])]
+		ad := orig[:offset] // a PQ packet's associated data: the header
 		msg := msg[offset:]
 		// The size check above counts a byte a varint, and Uvarint takes up to 10: the sealed part must still hold
 		// the sender's next key, or opening it would slice that key out of less (a panic in this actor)
@@ -689,9 +811,18 @@ func (info *sessionInfo) doRecv(from phony.Actor, msg []byte) {
 			info.rx += uint64(len(msg))
 			info._resetTimer()
 			if info.pq {
-				if info.lastOpened.IsZero() {
-					// traffic opened under keys from a verified PQ init or ack: a PQ session, both ends
-					info.mgr.pc.pq.markSticky(&info.ed, true)
+				// traffic opened under keys from a verified PQ init or ack: a PQ session, both ends, and the key is held
+				// to PQ (before confirmed, which the manager reads first). Raised in the sticky LRU again at most once
+				// in pqStickyRefresh, so that keys with a packet each do not push out a peer with traffic all along
+				if now := info.mgr.pc.pq.now(); info.stickyAt.IsZero() || now.Sub(info.stickyAt) >= pqStickyRefresh {
+					info.stickyAt = now
+					var notAfter uint64
+					if info.peerKey != nil {
+						notAfter = info.peerKey.notAfter
+					}
+					info.mgr.pc.pq.markSticky(&info.ed, notAfter, true)
+				}
+				if !info.confirmed.Load() {
 					info.confirmed.Store(true)
 				}
 				info.lastOpened = time.Now()
@@ -772,7 +903,8 @@ func (info *sessionInfo) _sendCipher() cipher.AEAD {
 // stale: none kept has it. A packet under a secret confirms it, and starts the time the older ones are kept.
 func (info *sessionInfo) _openPQ(out, msg, ad []byte, nonce uint64, epoch byte, pqCase int, shared *boxShared, fromKeySeq, toKeySeq uint64) ([]byte, bool, bool) {
 	now := time.Now()
-	n := pqNonce(nonce)
+	info.nonceBuf = pqNonce(nonce)
+	n := info.nonceBuf[:]
 	stale := true
 	for i := range info.own {
 		own := &info.own[i]
@@ -786,7 +918,7 @@ func (info *sessionInfo) _openPQ(out, msg, ad []byte, nonce uint64, epoch byte, 
 		if own.recv[pqCase] == nil {
 			own.recv[pqCase] = pqTrafficKey(shared, &own.secret, &info.ed, &info.mgr.pc.publicEd, fromKeySeq, toKeySeq)
 		}
-		opened, err := own.recv[pqCase].Open(out, n[:], msg, ad)
+		opened, err := own.recv[pqCase].Open(out, n, msg, ad)
 		if err != nil {
 			continue
 		}
@@ -923,4 +1055,5 @@ type sessionBuffer struct {
 	currentPriv boxPriv     // pairs with init.recv
 	nextPriv    boxPriv     // pairs with init.send
 	timer       *time.Timer // time.AfterFunc to clean up
+	since       time.Time   // made then
 }

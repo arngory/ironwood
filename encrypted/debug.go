@@ -21,6 +21,9 @@ type DebugSessionInfo struct {
 	RX     uint64
 	TX     uint64
 	PQ     bool // a hybrid post-quantum session
+	// PQConfirmed: a PQ session a packet of the peer's opened under: until then the peer may not have it, and a
+	// classic session beside it carries the traffic
+	PQConfirmed bool
 }
 
 func (d *Debug) GetSessions() (infos []DebugSessionInfo) {
@@ -38,6 +41,7 @@ func (d *Debug) GetSessions() (infos []DebugSessionInfo) {
 			info.Uptime = time.Since(session.since)
 			info.RX, info.TX = session.rx, session.tx
 			info.PQ = session.pq
+			info.PQConfirmed = session.pq && session.confirmed.Load()
 		})
 		infos = append(infos, info)
 	}

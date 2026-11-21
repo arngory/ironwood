@@ -151,7 +151,7 @@ func dropSessions(n *pqNode) {
 	phony.Block(&n.pc.sessions, func() {
 		for k, s := range n.pc.sessions.sessions {
 			dropped = append(dropped, s)
-			delete(n.pc.sessions.sessions, k)
+			n.pc.sessions._put(k, nil)
 		}
 	})
 	for _, s := range dropped {

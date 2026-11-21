@@ -88,8 +88,8 @@ func TestPQCrossedInitsStaleKey(t *testing.T) {
 	b.pc.WriteTo([]byte("first of B"), types.Addr(a.pub))
 	time.Sleep(300 * time.Millisecond)
 	b.dropType[sessionTypePQInit].Store(false)
-	if !hears(a, b, "after the crossing", 10*time.Second) {
-		t.Fatalf("nothing over the crossed inits in 10 s: A %s, B %s", session(a, b), session(b, a))
+	if !hears(a, b, "after the crossing", 3*time.Second) {
+		t.Fatalf("nothing over the crossed inits in 3 s: A %s, B %s", session(a, b), session(b, a))
 	}
 	t.Logf("the first packet after %v", time.Since(start).Round(10*time.Millisecond))
 	if !hears(b, a, "and back", 3*time.Second) {
@@ -270,10 +270,11 @@ func TestPQStickyEviction(t *testing.T) {
 	pc.SetPQ(cfg)
 	pc.pq.stickyMax = 3
 	k1, k2, k3, k4 := newPeerEd(t), newPeerEd(t), newPeerEd(t), newPeerEd(t)
-	pc.pq.markSticky(&k1, true)
-	pc.pq.markSticky(&k2, false)
-	pc.pq.markSticky(&k3, false)
-	pc.pq.markSticky(&k4, false)
+	day := uint64(time.Now().Add(24 * time.Hour).Unix())
+	pc.pq.markSticky(&k1, day, true)
+	pc.pq.markSticky(&k2, day, false)
+	pc.pq.markSticky(&k3, day, false)
+	pc.pq.markSticky(&k4, day, false)
 	if !pc.pq.required(&k1) || pc.pq.required(&k2) || !pc.pq.required(&k3) || !pc.pq.required(&k4) {
 		t.Fatalf("held to PQ: k1 (traffic) %v, k2 (oldest handshake) %v, k3 %v, k4 %v",
 			pc.pq.required(&k1), pc.pq.required(&k2), pc.pq.required(&k3), pc.pq.required(&k4))
@@ -404,13 +405,18 @@ func TestPQTrafficTampered(t *testing.T) {
 	// no re-init of B's on a failure: it would change the keys under the packets held back
 	b.dropType[sessionTypePQInit].Store(true)
 	aKey := a.key()
-	deliver := func(data []byte) bool {
+	// delivered: want is read at B (a late copy of "settled", sent again by hears, is not the packet)
+	deliver := func(data []byte, want string) bool {
 		b.pc.sessions.handleData(nil, &aKey, append(allocBytes(0), data...))
-		select {
-		case <-b.heard:
-			return true
-		case <-time.After(300 * time.Millisecond):
-			return false
+		for timeout := time.After(300 * time.Millisecond); ; {
+			select {
+			case got := <-b.heard:
+				if got == want {
+					return true
+				}
+			case <-timeout:
+				return false
+			}
 		}
 	}
 	epochAt := 1
@@ -420,10 +426,10 @@ func TestPQTrafficTampered(t *testing.T) {
 	}
 	bad := append([]byte(nil), one...)
 	bad[epochAt] ^= 0x55
-	if deliver(bad) {
+	if deliver(bad, "one") {
 		t.Fatal("a packet with its epoch changed was delivered")
 	}
-	if !deliver(one) {
+	if !deliver(one, "one") {
 		t.Fatal("the packet unchanged was not delivered")
 	}
 	var info *sessionInfo
@@ -437,11 +443,11 @@ func TestPQTrafficTampered(t *testing.T) {
 		})
 	}
 	flip()
-	if deliver(two) {
+	if deliver(two, "two") {
 		t.Fatal("a packet opened under another secret of the receiver's")
 	}
 	flip()
-	if !deliver(two) {
+	if !deliver(two, "two") {
 		t.Fatal("the packet did not open under the secret as it was")
 	}
 }

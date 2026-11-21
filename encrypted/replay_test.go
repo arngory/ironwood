@@ -193,3 +193,29 @@ func TestReplayThrough(t *testing.T) {
 		}
 	}
 }
+
+// TestRatchetStepKeepsMark (R5-1): a ratchet step (_fixShared with the next key's mark) leaves every nonce up to it
+// refused under the new receive key: packets taken under it while it was the next key do not open again. The window
+// kept only the step's own nonce, and the rest of the minute before the step opened twice
+func TestRatchetStepKeepsMark(t *testing.T) {
+	var ed edPub
+	cur, _ := newBoxKeys()
+	next, _ := newBoxKeys()
+	info := newSession(&ed, cur, next, 1)
+	for n := uint64(1); n <= 20; n++ {
+		info.recvWindow.commit(n)
+	}
+	info._fixShared(5000, 0)
+	for n := uint64(0); n <= 5000; n++ {
+		if info.recvWindow.check(n) {
+			t.Fatalf("nonce %d, at or below the step's 5000, taken after the step", n)
+		}
+	}
+	if !info.recvWindow.check(5001) || !info.recvWindow.check(5002) {
+		t.Fatal("a nonce after the step's rejected")
+	}
+	info._fixShared(0, 0) // a new session (init, ack): a fresh window
+	if info.recvWindow.check(0) || !info.recvWindow.check(1) {
+		t.Fatal("a fresh window after a new session is not fresh")
+	}
+}

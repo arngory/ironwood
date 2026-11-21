@@ -581,9 +581,12 @@ func (info *sessionInfo) _fixShared(recvNonce, sendNonce uint64) {
 	getShared(&info.nextSendShared, &info.next, &info.sendPriv)
 	getShared(&info.nextRecvShared, &info.next, &info.recvPriv)
 	info.nextSendNonce, info.nextRecvNonce = 0, 0
-	info.recvWindow.reset()
 	if recvNonce != 0 {
-		info.recvWindow.commit(recvNonce)
+		// a ratchet step: the new receive key was the next key, taken up to recvNonce under a strict mark
+		// (arngory/ironwood#2, review R5-1)
+		info.recvWindow.through(recvNonce)
+	} else {
+		info.recvWindow.reset()
 	}
 	info.sendNonce = sendNonce
 }
@@ -867,7 +870,7 @@ func (info *sessionInfo) doRecv(from phony.Actor, msg []byte) {
 					// Generate new next keys
 					info.nextPub, info.nextPriv = newBoxKeys()
 					// Update nonces
-					info._fixShared(nonce, 0)
+					info._fixShared(info.nextSendNonce, 0)
 					info.rotated = time.Now()
 				}
 			}
@@ -893,7 +896,7 @@ func (info *sessionInfo) doRecv(from phony.Actor, msg []byte) {
 					// Generate new next keys
 					info.nextPub, info.nextPriv = newBoxKeys()
 					// Update nonces
-					info._fixShared(nonce, 0)
+					info._fixShared(info.nextSendNonce, 0)
 					info.rotated = time.Now()
 				}
 			}

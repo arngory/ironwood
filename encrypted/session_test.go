@@ -22,6 +22,7 @@ import (
 // lookup lost while the tree converges never brings). The sender resends the same init with each packet; the receiver must
 // ack it again, or the contact waits for the receiver's session to time out (sessionTimeout, a minute).
 func TestRepeatedInitIsAckedAgain(t *testing.T) {
+	t.Parallel()
 	pubA, privA, _ := ed25519.GenerateKey(nil)
 	pubB, privB, _ := ed25519.GenerateKey(nil)
 	a, err := NewPacketConn(privA)
@@ -112,6 +113,7 @@ func TestRepeatedInitIsAckedAgain(t *testing.T) {
 // ack, and an ack of the first time would be dropped by its seq. A fresh ack to each replay would ratchet the
 // sender's keys, one replay a second keeping the session renegotiating.
 func TestReplayedInitKeepsKeys(t *testing.T) {
+	t.Parallel()
 	pubA, privA, _ := ed25519.GenerateKey(nil)
 	pubB, privB, _ := ed25519.GenerateKey(nil)
 	a, _ := NewPacketConn(privA)
@@ -198,6 +200,7 @@ func TestReplayedInitKeepsKeys(t *testing.T) {
 // gone) both arrive. A strict high-water mark of nonces lost the first, an older nonce than one already taken; the
 // replay window takes it, once.
 func TestReorderedTrafficArrives(t *testing.T) {
+	t.Parallel()
 	pubA, privA, _ := ed25519.GenerateKey(nil)
 	pubB, privB, _ := ed25519.GenerateKey(nil)
 	a, _ := NewPacketConn(privA)
@@ -410,6 +413,7 @@ func (c *lossyConn) SetWriteDeadline(t time.Time) error { return nil }
 // so the packet passed it, opened, and its 32-byte next key was sliced out of 5 bytes: a panic in the session's
 // actor, the whole process down. It is dropped now, and the session goes on.
 func TestShortTrafficDropped(t *testing.T) {
+	t.Parallel()
 	pubA, privA, _ := ed25519.GenerateKey(nil)
 	pubB, privB, _ := ed25519.GenerateKey(nil)
 	a, _ := NewPacketConn(privA)

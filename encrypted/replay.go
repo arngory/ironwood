@@ -85,3 +85,13 @@ func (w *replayWindow) commit(nonce uint64) {
 	b := (nonce / replayBlockBits) & replayBlockMask
 	w.ring[b] |= 1 << (nonce % replayBlockBits)
 }
+
+// through: every nonce up to n as seen, n the head (a key's packets accepted while their nonces had to rise above a
+// high-water mark n, carried over to a window: none of them opens again)
+func (w *replayWindow) through(n uint64) {
+	w.head = n
+	for i := range w.ring {
+		w.ring[i] = ^uint64(0)
+	}
+	w.ring[(n/replayBlockBits)&replayBlockMask] = ^uint64(0) >> (replayBlockBits - 1 - n%replayBlockBits)
+}

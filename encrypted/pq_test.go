@@ -364,7 +364,11 @@ func TestPQInitResealedFails(t *testing.T) {
 		t.Fatal(err)
 	}
 	toC := ownAsPeer(t, c)
-	sealed, err := hpke.Seal(toC.hpke, pqKDF, pqAEAD, pqBinding(pqHPKEInfo, sessionTypePQInit, &a.publicEd, &c.publicEd, toC.seq, &toC.hash), payload)
+	toCKey, err := toC.hpkeKey()
+	if err != nil {
+		t.Fatal(err)
+	}
+	sealed, err := hpke.Seal(toCKey, pqKDF, pqAEAD, pqBinding(pqHPKEInfo, sessionTypePQInit, &a.publicEd, &c.publicEd, toC.seq, &toC.hash), payload)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -407,9 +411,9 @@ func TestPQInfoRules(t *testing.T) {
 	pc := newBarePC(t)
 	now := time.Now()
 	pc.pq.now = func() time.Time { return now }
-	var logged []string
+	var log logSink
 	cfg := pqOn
-	cfg.Logf = func(f string, args ...any) { logged = append(logged, f) }
+	cfg.Logf = log.f
 	pc.SetPQ(cfg)
 	var peer edPub
 	copy(peer[:], pc.publicEd[:]) // any valid key does: its X25519 half is what the table needs
@@ -450,13 +454,8 @@ func TestPQInfoRules(t *testing.T) {
 			t.Fatalf("a key numbered %d, valid until %d (now %d) taken", bad[0], bad[1], n)
 		}
 	}
-	refusals := 0
-	for _, line := range logged {
-		if bytes.Contains([]byte(line), []byte("out of time")) {
-			refusals++
-		}
-	}
-	if refusals != 1 {
+	logSync(pc)
+	if refusals := log.count("out of time"); refusals != 1 {
 		t.Fatalf("log lines on a refusal by time: %d", refusals)
 	}
 }

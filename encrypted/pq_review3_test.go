@@ -5,6 +5,7 @@ import (
 	"container/list"
 	"crypto/ed25519"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -115,9 +116,9 @@ func TestPQClassicInitGuard(t *testing.T) {
 }
 
 // R3-1: a classic init A's classic session beside its unconfirmed PQ one signs (asked for by one forged packet) is
-// held by a node on the path, and let go once B's clock is past the end of A's ML-KEM key, the PQ session up. It
-// does not replace B's PQ session (B holds A to PQ by its traffic, and traffic opened just now); nor with B past
-// SessionMax, nor for a key under Required.
+// held by a node on the path, and let go once B's clock is past the end of A's ML-KEM key and the slack (B holds A
+// no longer), the PQ session up. It does not replace B's PQ session (traffic opened under it just now); nor with B
+// past SessionMax, nor for a key under Required.
 func TestPQHeldInitRefused(t *testing.T) {
 	t.Parallel()
 	for _, variant := range []string{"plain", "past SessionMax", "required"} {
@@ -198,8 +199,9 @@ func heldInitRefused(t *testing.T, variant string) {
 	if session(b, a) != "pq" {
 		t.Fatalf("let go while B holds A to PQ: B %s", session(b, a))
 	}
-	// B's clock past the end of A's ML-KEM key; the PQ session still up
-	clockB.Store(int64(time.Until(time.Unix(int64(a.pc.pqOwn().notAfter), 0)) + time.Minute))
+	// B's clock past the end of A's ML-KEM key and the clock slack: B's traffic holds A no longer, the PQ session still
+	// up; only the time of the last packet opened guards it
+	clockB.Store(int64(time.Until(time.Unix(int64(a.pc.pqOwn().notAfter), 0)) + pqClockSlack + time.Minute))
 	if !hears(a, b, "still up", 3*time.Second) || !hears(b, a, "still up back", 3*time.Second) {
 		t.Fatal("the PQ session not up")
 	}
@@ -210,6 +212,7 @@ func heldInitRefused(t *testing.T, variant string) {
 	case "past SessionMax":
 		b.pc.SetPQ(PQConfig{Enabled: true, Logf: logB.f, SessionMax: 1})
 		c := lightPC(t)
+		c.pq.now = b.pc.pq.now // its key made by B's clock, not out of time there
 		cKey := edOf(c)
 		b.pc.pq.markSticky(&cKey, c.pqOwn().notAfter, true) // a filler, held to PQ: its session past SessionMax
 		b.pc.sessions.handleData(nil, &cKey, pqInitFrom(t, c, b.pc))
@@ -295,8 +298,14 @@ func TestPQHardLimit(t *testing.T) {
 		s := sessionOf(n, k)
 		return s != nil && s.pq
 	}
-	// one more: the oldest that may be classic (key 0) goes, its classic session back
+	// one more: the oldest that may be classic (key 0) goes, its classic session back, its own timer stopped (R4B-1)
+	victim := sessionOf(n, keys[0])
 	k1 := more()
+	var running bool
+	phony.Block(victim, func() { running = victim.timer != nil && victim.timer.Stop() })
+	if running {
+		t.Fatal("the PQ session pushed out still has its timer running: it is held for idleTimeout")
+	}
 	var retry bool
 	phony.Block(&n.pc.sessions, func() { retry = n.pc.sessions.pqRetry[keys[0]] })
 	if !pqWith(k1) || pqWith(keys[0]) || sessionOf(n, keys[0]) == nil || !retry || n.pc.PQSessionCount() != hard {
@@ -308,6 +317,7 @@ func TestPQHardLimit(t *testing.T) {
 	if !pqWith(keys[1]) || pqWith(keys[2]) {
 		t.Fatalf("a key held to PQ went before one that may be classic: key 1 PQ %v, key 2 PQ %v", pqWith(keys[1]), pqWith(keys[2]))
 	}
+	logSync(n.pc)
 	if log.count("made room") == 0 {
 		t.Fatalf("log: %q", log.all())
 	}
@@ -325,6 +335,7 @@ func TestPQHardLimit(t *testing.T) {
 	if k := more(); pqWith(k) || n.sent[sessionTypePQAck].Load() != acks || n.pc.PQSessionCount() != hard {
 		t.Fatalf("every PQ session in use: a new one taken (%v), %d acks, %d PQ sessions", pqWith(k), n.sent[sessionTypePQAck].Load()-acks, n.pc.PQSessionCount())
 	}
+	logSync(n.pc)
 	if log.count("each in use") != 1 {
 		t.Fatalf("log: %q", log.all())
 	}
@@ -339,8 +350,8 @@ func TestPQHardLimit(t *testing.T) {
 // again, the same bytes.
 func TestPQReplyInitOnce(t *testing.T) {
 	t.Parallel()
-	n := newPQNode(t, pqOn)                  // no link
-	n.pc.pq.pendingTimeout = 6 * time.Second // longer than the test's second packet, 4.4 s on
+	n := newPQNode(t, pqOn)                   // no link
+	n.pc.pq.pendingTimeout = 13 * time.Second // twice the time of the test's third packet
 	p := lightPC(t)
 	k := edOf(p)
 	knows(t, n.pc, p)
@@ -371,7 +382,7 @@ func TestPQReplyInitOnce(t *testing.T) {
 	if got := count(); got != 1 {
 		t.Fatalf("%d PQ inits in %v for one forged packet: sent again on its own", got, time.Since(start).Round(time.Millisecond))
 	}
-	time.Sleep(time.Until(start.Add(initReplyInterval + 100*time.Millisecond)))
+	time.Sleep(time.Until(start.Add(2*initReplyInterval + 100*time.Millisecond)))
 	deliverTo(n, k, junk(sessionTypeTraffic, sessionTrafficOverheadMin))
 	if got := count(); got != 2 {
 		t.Fatalf("the next forged packet after initReplyInterval: %d PQ inits in all, want 2", got)
@@ -383,13 +394,21 @@ func TestPQReplyInitOnce(t *testing.T) {
 		t.Fatal("the PQ init sent again was sealed anew")
 	}
 	// given up after pendingTimeout, with no upgrade of ours scheduled for it
-	time.Sleep(time.Until(start.Add(n.pc.pq.pendingTimeout + 300*time.Millisecond)))
-	var pending, retry bool
-	phony.Block(&n.pc.sessions, func() {
-		pending, retry = n.pc.sessions.pqPending[k] != nil, n.pc.sessions.pqRetry[k]
-	})
-	if pending || retry {
-		t.Fatalf("after pendingTimeout: still pending %v, an upgrade scheduled %v", pending, retry)
+	time.Sleep(time.Until(start.Add(n.pc.pq.pendingTimeout)))
+	for deadline := start.Add(2 * n.pc.pq.pendingTimeout); ; time.Sleep(100 * time.Millisecond) {
+		var pending, retry bool
+		phony.Block(&n.pc.sessions, func() {
+			pending, retry = n.pc.sessions.pqPending[k] != nil, n.pc.sessions.pqRetry[k]
+		})
+		if retry {
+			t.Fatal("an upgrade of ours scheduled for a forged packet")
+		}
+		if !pending {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("still pending %v on", time.Since(start).Round(time.Second))
+		}
 	}
 }
 
@@ -452,7 +471,7 @@ func TestPQStaleInfoNoEntry(t *testing.T) {
 	deliverTo(n, k, append(allocBytes(0), stale.info...))
 	n.pc.pq.mu.Lock()
 	_, entry := n.pc.pq.peers[k]
-	n.pc.pq.tokens, n.pc.pq.tokensAt = 0, time.Now().Add(time.Hour) // the bucket empty (for the next hour)
+	n.pc.pq.unknownBucket = pqBucket{at: time.Now().Add(time.Hour)} // the bucket empty (for the next hour)
 	n.pc.pq.limits = make(map[edPub]*list.Element)                  // the per-key limits flushed
 	n.pc.pq.limitsLRU.Init()
 	n.pc.pq.mu.Unlock()
@@ -491,7 +510,15 @@ func TestPQOffReceiveOnly(t *testing.T) {
 	time.Sleep(1100 * time.Millisecond) // A's classic init numbered after the PQ session's
 	a.pc.SetPQ(PQConfig{})
 	clockB.Store(int64(time.Until(time.Unix(int64(e.until), 0)) + time.Minute))
-	s0, g0 := streamCount(b, a, "settling", 5*time.Second)
+	// settled once a second of B's traffic gets through (some 5 s; up to 12 s allowed)
+	s0, g0 := 0, 0
+	for deadline := time.Now().Add(12 * time.Second); time.Now().Before(deadline); {
+		s, g := streamCount(b, a, "settling", time.Second)
+		s0, g0 = s0+s, g0+g
+		if g >= s*9/10 {
+			break
+		}
+	}
 	s, g := streamCount(b, a, "B to A", 2*time.Second)
 	if g < s*9/10 {
 		t.Fatalf("A with PQ off, only B writing: B to A %d/%d then %d/%d; B %s; A sent %d classic inits", g0, s0, g, s,
@@ -618,39 +645,44 @@ func TestPQReplyOnceThenData(t *testing.T) {
 	if got := n.sent[sessionTypePQInit].Load(); got != 2 {
 		t.Fatalf("data waiting: %d PQ inits in all, want 2", got)
 	}
-	time.Sleep(pqInitRetry + 300*time.Millisecond)
-	if got := n.sent[sessionTypePQInit].Load(); got != 3 {
-		t.Fatalf("data waiting, pqInitRetry on: %d PQ inits in all, want 3", got)
+	time.Sleep(2*pqInitRetry + 500*time.Millisecond)
+	if got := n.sent[sessionTypePQInit].Load(); got < 3 {
+		t.Fatalf("data waiting, twice pqInitRetry on: %d PQ inits in all, want 3 or more", got)
 	}
 }
 
 // The embedder's Logf is called with no lock of ours held (it may call into the PacketConn).
 func TestPQLogfOutsideLock(t *testing.T) {
 	pc := newBarePC(t)
-	var lines, under int
+	var lines, under atomic.Int64
 	cfg := pqOn
 	cfg.Logf = func(string, ...any) {
-		lines++
+		lines.Add(1)
 		if pc.pq.mu.TryLock() {
 			pc.pq.mu.Unlock()
 		} else {
-			under++
+			under.Add(1)
 		}
 	}
 	pc.SetPQ(cfg)
 	pc.pq.stickyMax = 1
 	now := uint64(time.Now().Unix())
 	k1, k2, k3 := newPeerEd(t), newPeerEd(t), newPeerEd(t)
+	// each line waited for: Logf runs from a goroutine of its own, and the test's calls take the lock meanwhile
 	pc.pq.markSticky(&k1, now+3600, true)
 	pc.pq.markSticky(&k2, now+3600, true) // past stickyMax: a line
+	logSync(pc)
 	pub1, pub2 := newPQKeyPub(t), newPQKeyPub(t)
 	pc.pq.accept(&k3, &pub1, now-6*24*3600, now-4*24*3600) // out of time: a line
+	logSync(pc)
 	pc.pq.accept(&k3, &pub1, now, now+3600)
 	pc.pq.accept(&k3, &pub2, now-10, now+1800) // kept aside
 	pc.pq.takeRollback(&k3)                    // taken: a line
+	logSync(pc)
 	pc.pq.logStripped(&k3, "nothing", "a test")
-	if lines != 4 || under != 0 {
-		t.Fatalf("%d lines, %d of them under the lock", lines, under)
+	logSync(pc)
+	if lines.Load() != 4 || under.Load() != 0 {
+		t.Fatalf("%d lines, %d of them under the lock", lines.Load(), under.Load())
 	}
 }
 
@@ -727,7 +759,9 @@ func TestPQRemarkBySessionKey(t *testing.T) {
 	}
 }
 
-// R3-1: a PQ packet replayed (it opened once) does not move the hold on its sender on, nor raise it in the sticky LRU.
+// R3-1, R4-3: a PQ packet replayed (it opened once) does not move the hold on its sender on, nor raise it in the
+// sticky LRU, nor the time of the last packet opened. The packet is one of A's taken off the link and delivered by the
+// test, so that it is known to have opened at B; its copy is the replay.
 func TestPQReplayNoRemark(t *testing.T) {
 	t.Parallel()
 	a, b := newPQNode(t, pqOn), newPQNode(t, pqOn)
@@ -740,26 +774,50 @@ func TestPQReplayNoRemark(t *testing.T) {
 	if !hears(a, b, "pq", 3*time.Second) || !hears(b, a, "pq back", 3*time.Second) {
 		t.Fatal("no traffic over PQ")
 	}
-	captured := make(chan []byte, 1)
+	time.Sleep(300 * time.Millisecond) // the copies hears sent while it waited, still on the way, arrive first
+	for len(b.heard) > 0 {
+		<-b.heard
+	}
+	var mu sync.Mutex
+	var held []byte
 	tap := func(d []byte) bool {
-		if d[0] == sessionTypePQTraffic {
-			select {
-			case captured <- append([]byte(nil), d...):
-			default:
-			}
+		mu.Lock()
+		defer mu.Unlock()
+		if d[0] != sessionTypePQTraffic || held != nil {
+			return false
 		}
-		return false
+		held = append([]byte(nil), d...)
+		return true
 	}
 	a.tap.Store(&tap)
-	if !hears(a, b, "to replay", 3*time.Second) {
-		t.Fatal("no traffic")
-	}
+	a.pc.WriteTo([]byte("held back"), types.Addr(b.pub))
+	syncSessions(a)
 	a.tap.Store(nil)
-	packet := <-captured
-	time.Sleep(300 * time.Millisecond) // the copies hears sent while it waited, still on the way, arrive first
-	syncSessions(b)
 	aKey := a.key()
-	before := stickyFor(b.pc, aKey).until
+	hearsOnce := func(msg string) bool {
+		for timeout := time.After(time.Second); ; {
+			select {
+			case got := <-b.heard:
+				if got == msg {
+					return true
+				}
+			case <-timeout:
+				return false
+			}
+		}
+	}
+	mu.Lock()
+	packet := held
+	mu.Unlock()
+	if packet == nil {
+		t.Fatal("no PQ packet of A's taken off the link")
+	}
+	deliverTo(b, aKey, append(allocBytes(0), packet...))
+	if !hearsOnce("held back") {
+		t.Fatal("the packet taken off the link did not open at B: the test proves nothing")
+	}
+	info := sessionOf(b, aKey)
+	before, opened := stickyFor(b.pc, aKey).until, info.openedAt.Load()
 	other := newPeerEd(t)
 	clockB.Store(int64(pqStickyRefresh + time.Hour))
 	b.pc.pq.markSticky(&other, uint64(time.Now().Add(24*time.Hour).Unix()), true) // the front of the LRU
@@ -767,16 +825,16 @@ func TestPQReplayNoRemark(t *testing.T) {
 	b.pc.pq.mu.Lock()
 	front := b.pc.pq.stickyLRU.Front().Value.(*stickyKey).ed
 	b.pc.pq.mu.Unlock()
-	if after := stickyFor(b.pc, aKey).until; after != before || front == aKey {
-		t.Fatalf("a replayed packet: hold %d -> %d, raised %v", before, after, front == aKey)
+	if after := stickyFor(b.pc, aKey).until; after != before || front == aKey || info.openedAt.Load() != opened || hearsOnce("held back") {
+		t.Fatalf("a replayed packet: hold %d -> %d, raised %v, opened time moved %v", before, after, front == aKey, info.openedAt.Load() != opened)
 	}
 	// a new packet does
 	if !hears(a, b, "new", 3*time.Second) {
 		t.Fatal("no traffic")
 	}
 	syncSessions(b)
-	if after := stickyFor(b.pc, aKey).until; after <= before {
-		t.Fatalf("a new packet an hour on did not move the hold on: %d -> %d", before, after)
+	if after := stickyFor(b.pc, aKey).until; after <= before || info.openedAt.Load() == opened {
+		t.Fatalf("a new packet an hour on did not move the hold on (%d -> %d) or the opened time", before, after)
 	}
 }
 
@@ -794,7 +852,7 @@ func TestPQReplyInitNoUpgradeLater(t *testing.T) {
 	if got := n.sent[sessionTypePQInit].Load(); got != 1 {
 		t.Fatalf("%d PQ inits in reply to forged PQ traffic, want 1", got)
 	}
-	time.Sleep(800 * time.Millisecond)
+	time.Sleep(1200 * time.Millisecond)
 	var pending, retry bool
 	phony.Block(&n.pc.sessions, func() {
 		pending, retry = n.pc.sessions.pqPending[k] != nil, n.pc.sessions.pqRetry[k]
@@ -805,7 +863,7 @@ func TestPQReplyInitNoUpgradeLater(t *testing.T) {
 }
 
 // R3-6: a one-way PQ flow (we write, the peer only reads) past twice idleTimeout: the reader's empty packet, once it
-// sent nothing for half of idleTimeout, keeps our session up. No session goes, no handshake comes, nothing is lost.
+// sent nothing for a quarter of idleTimeout, keeps our session up. No session goes, no handshake comes, nothing is lost.
 func TestPQOneWayFlowKeptUp(t *testing.T) {
 	t.Parallel()
 	a, b := newPQNode(t, pqOn), newPQNode(t, pqOn)

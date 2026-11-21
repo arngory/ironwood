@@ -47,6 +47,7 @@ type sessionManager struct {
 	pqCount        atomic.Int64           // the PQ sessions in sessions (_put); read by PQSessionCount
 	unconfirmedMax int                    // pqUnconfirmedMax, a test's own
 	idleTimeout    time.Duration          // sessionTimeout, a test's own
+	evictIdle      time.Duration          // pqEvictIdle, a test's own
 }
 
 func (mgr *sessionManager) init(pc *PacketConn) {
@@ -59,6 +60,7 @@ func (mgr *sessionManager) init(pc *PacketConn) {
 	mgr.pqUnconfirmed = make(map[edPub]*sessionInfo)
 	mgr.unconfirmedMax = pqUnconfirmedMax
 	mgr.idleTimeout = sessionTimeout
+	mgr.evictIdle = pqEvictIdle
 }
 
 // _put: info as the session with ed, nil for none; the count of PQ sessions follows
@@ -91,10 +93,18 @@ func (mgr *sessionManager) _restoreClassic(info *sessionInfo) {
 // _evict: the PQ session info goes, to make room: the classic one beside it takes its place where there is one (and
 // the upgrade is tried again later); then: which, for the log
 func (mgr *sessionManager) _evict(info *sessionInfo) (then string) {
+	// its timer stopped: else it would hold the session (some 18 KB) for idleTimeout, and the hard limit would not
+	// bound the memory of a churn of new ones
+	defer info.Act(mgr, func() {
+		if info.timer != nil {
+			info.timer.Stop()
+		}
+	})
 	if mgr.pqUnconfirmed[info.ed] == info {
 		delete(mgr.pqUnconfirmed, info.ed)
 	}
-	if info.fallback != nil && !mgr.pc.pq.required(&info.ed) {
+	// beside a confirmed one, the classic session is stale (the peer left it), as for dropPQ and _expire
+	if info.fallback != nil && !info.confirmed.Load() && !mgr.pc.pq.required(&info.ed) {
 		mgr._restoreClassic(info)
 		mgr._upgradeLater(info.ed)
 		return "its classic session stays"
@@ -208,9 +218,15 @@ func (mgr *sessionManager) handleData(from phony.Actor, pub *edPub, data []byte)
 			case len(data) != sessionInitSize:
 				// not an init: no answer to it
 			case mgr.pc.pq.required(pub):
-				// it must be PQ: our PQInfo, so that it can start a PQ init if it has them
+				// it must be PQ. With no session and its ML-KEM key known: our PQ init, as to its classic traffic (it
+				// wants a session, and may start no PQ one: past its SessionMax, it starts none with a key that may be
+				// classic, and we may have nothing to send). Else our PQInfo, so that it can start one if it has them
 				mgr._logClassicAsked(pub, data)
-				mgr._replyPQInfo(pub)
+				if key := mgr.pc.pq.usableKey(pub); key != nil && mgr.sessions[*pub] == nil {
+					mgr._replyPQInit(pub, key)
+				} else {
+					mgr._replyPQInfo(pub)
+				}
 			default:
 				if init := new(sessionInit); init.decrypt(&mgr.pc.secretBox, pub, data, mgr.pc.groupAuth) {
 					if info := mgr.sessions[*pub]; pq && info != nil && info.pq && info.confirmed.Load() {
@@ -221,7 +237,7 @@ func (mgr *sessionManager) handleData(from phony.Actor, pub *edPub, data []byte)
 						// session within idleTimeout: the init may be one its sender signed beside an unconfirmed PQ
 						// session, held back on the way and let go now
 						if init.seq <= info.initSeq || mgr._openedWithin(info, mgr.idleTimeout) {
-							mgr._sendPQInfoDue(pub)
+							mgr._sendPQInfoDue(pub, askSigned)
 							break
 						}
 						mgr._put(*pub, nil)
@@ -473,6 +489,7 @@ func (mgr *sessionManager) sendAck(dest *edPub, ack *sessionAck) {
 type sessionInfo struct {
 	phony.Inbox
 	mgr            *sessionManager
+	id             uint64 // its number in the process (_resetTimer)
 	seq            uint64 // remote seq
 	ed             edPub  // remote ed key
 	remoteKeySeq   uint64 // signals rotation of current/next
@@ -514,6 +531,7 @@ type sessionInfo struct {
 	lastOpened   time.Time
 	stickyAt     time.Time    // the key marked sticky by traffic of this session, last (pq.now)
 	sentAt       time.Time    // a PQ packet of ours sent under it, last
+	initCurrent  boxPub       // the peer's current key in the last init or ack taken
 	confirmed    atomic.Bool  // a PQ packet opened (read by the manager)
 	openedAt     atomic.Int64 // then, last (pq.now, Unix nanoseconds; read by the manager)
 	adBuf        [32]byte     // a PQ packet's header as associated data (Seal: not where the output goes)
@@ -543,6 +561,7 @@ const pqOwnSecretsMax = 4
 
 func newSession(ed *edPub, current, next boxPub, seq uint64) *sessionInfo {
 	info := new(sessionInfo)
+	info.id = sessionIDs.Add(1)
 	info.seq = seq - 1 // so the first update works
 	info.ed = *ed
 	info.current, info.next = current, next
@@ -569,16 +588,24 @@ func (info *sessionInfo) _fixShared(recvNonce, sendNonce uint64) {
 	info.sendNonce = sendNonce
 }
 
+// _resetTimer: the session goes after idleTimeout with nothing under it. The timer holds its key and number, not the
+// session: a timer stopped stays in the runtime's heap a while, and would hold a session pushed out (some 6.5 KB)
 func (info *sessionInfo) _resetTimer() {
 	if info.timer != nil {
 		info.timer.Stop()
 	}
-	info.timer = time.AfterFunc(info.mgr.idleTimeout, func() {
-		info.mgr.Act(nil, func() {
-			info.mgr._expire(info)
+	mgr, ed, id := info.mgr, info.ed, info.id
+	info.timer = time.AfterFunc(mgr.idleTimeout, func() {
+		mgr.Act(nil, func() {
+			if s := mgr.sessions[ed]; s != nil && s.id == id {
+				mgr._expire(s)
+			}
 		})
 	})
 }
+
+// sessionIDs numbers the sessions of the process (sessionInfo.id)
+var sessionIDs atomic.Uint64
 
 // handleInit takes an init (pqi: it as a PQ init, nil for a classic one)
 func (info *sessionInfo) handleInit(from phony.Actor, init *sessionInit, pqi *pqInit) {
@@ -586,7 +613,10 @@ func (info *sessionInfo) handleInit(from phony.Actor, init *sessionInit, pqi *pq
 		if init.seq < info.seq {
 			return
 		}
-		if init.seq == info.seq {
+		// A PQ init of the same second as the last one taken, with other keys, is a new one of the peer's (it lost
+		// the session and began anew within the second: the seq is in whole seconds), not a repeat: taken. One the
+		// same (a repeat, or replayed) is not; no one else can sign one. Classic as upstream
+		if init.seq == info.seq && (pqi == nil || init.current == info.initCurrent) {
 			// The same init again: its sender has not had our ack, which may have gone out before we had a path back
 			// (and the lookup for one was lost), or got lost on the way. Ignored, the contact would wait for this
 			// session to time out. While nothing came from the sender over the session, the very ack of the first
@@ -615,7 +645,9 @@ func (info *sessionInfo) handleInit(from phony.Actor, init *sessionInit, pqi *pq
 
 func (info *sessionInfo) handleAck(from phony.Actor, ack *sessionAck, pqi *pqInit) {
 	info.Act(from, func() {
-		if ack.seq <= info.seq {
+		// a PQ ack of the same second as the last init or ack taken, with other keys, is new, as for an init
+		// (handleInit): the peer took an init of ours of that second, and its keys moved on
+		if ack.seq < info.seq || (ack.seq == info.seq && (pqi == nil || ack.current == info.initCurrent)) {
 			return
 		}
 		info._handleUpdate(&ack.sessionInit, pqi, false)
@@ -633,6 +665,7 @@ func (info *sessionInfo) _handleUpdate(init *sessionInit, pqi *pqInit, answering
 	}
 	info.current = init.current
 	info.next = init.next
+	info.initCurrent = init.current
 	info.seq = init.seq
 	info.remoteKeySeq = init.keySeq
 	// Advance our keys, since this counts as a response
@@ -641,8 +674,53 @@ func (info *sessionInfo) _handleUpdate(init *sessionInit, pqi *pqInit, answering
 	info.nextPub, info.nextPriv = newBoxKeys()
 	info.localKeySeq++
 	// Don't roll back sendNonce, just to be extra safe
+	old := info._replay()
 	info._fixShared(0, info.sendNonce)
+	info._carryReplay(&old)
 	info._resetTimer()
+}
+
+// sessionReplay: a session's receive keys and the replay state of each
+type sessionReplay struct {
+	recv, nextSend, nextRecv           boxShared
+	window                             replayWindow
+	nextSendNonce, nextRecvNonce, head uint64
+}
+
+func (info *sessionInfo) _replay() sessionReplay {
+	return sessionReplay{
+		recv: info.recvShared, nextSend: info.nextSendShared, nextRecv: info.nextRecvShared,
+		window: info.recvWindow, nextSendNonce: info.nextSendNonce, nextRecvNonce: info.nextRecvNonce, head: info.recvWindow.head,
+	}
+}
+
+// _carryReplay: after an init or ack of the peer's (_handleUpdate), each receive key that was one before keeps its
+// replay state, or a packet seen under it would open again: an update that keeps the peer's keys moves ours on, and
+// the send keys become receive ones, under which the peer's packets had a high-water mark of their nonces (classic
+// and PQ alike; a key not seen before starts afresh)
+func (info *sessionInfo) _carryReplay(old *sessionReplay) {
+	seen := func(k *boxShared) (uint64, bool) {
+		switch *k {
+		case old.nextSend:
+			return old.nextSendNonce, true
+		case old.nextRecv:
+			return old.nextRecvNonce, true
+		case old.recv:
+			return old.head, true
+		}
+		return 0, false
+	}
+	if info.recvShared == old.recv {
+		info.recvWindow = old.window
+	} else if n, ok := seen(&info.recvShared); ok {
+		info.recvWindow.through(n)
+	}
+	if n, ok := seen(&info.nextSendShared); ok {
+		info.nextSendNonce = n
+	}
+	if n, ok := seen(&info.nextRecvShared); ok {
+		info.nextRecvNonce = n
+	}
 }
 
 func (info *sessionInfo) doSend(from phony.Actor, msg []byte) {
@@ -860,9 +938,9 @@ func (info *sessionInfo) doRecv(from phony.Actor, msg []byte) {
 				// traffic opened under keys from a verified PQ init or ack: a PQ session, both ends, and the key is held
 				// to PQ (before confirmed, which the manager reads first). Raised in the sticky LRU again at most once
 				// in pqStickyRefresh, so that keys with a packet each do not push out a peer with traffic all along
-				// (a packet replayed does not get here: the replay window turned it away before it was opened). The hold
-				// is by the ML-KEM key the session is under, which a key of the peer's in the table, newer, does not
-				// move on (markSticky)
+				// (a packet replayed does not get here: the replay window, carried over the session's re-inits
+				// (_carryReplay), turned it away before it was opened). The hold is by the ML-KEM key the session is
+				// under, which a key of the peer's in the table, newer, does not move on (markSticky)
 				now := info.mgr.pc.pq.now()
 				if info.stickyAt.IsZero() || now.Sub(info.stickyAt) >= pqStickyRefresh {
 					info.stickyAt = now
@@ -878,13 +956,14 @@ func (info *sessionInfo) doRecv(from phony.Actor, msg []byte) {
 				}
 				info.lastOpened = time.Now()
 				// The peer's session is kept up by what opens under it there: traffic of ours, or, while we only
-				// read (a one-way flow), an empty packet once we sent nothing for half of idleTimeout. A peer that
-				// turned PQ off sends nothing that opens here, and gets none: its silence still ends our session
+				// read (a one-way flow), an empty packet once we sent nothing for a quarter of idleTimeout (one
+				// lost, the next still comes in time). A peer that turned PQ off sends nothing that opens here, and
+				// gets none: its silence still ends our session
 				last := info.sentAt
 				if last.Before(info.since) {
 					last = info.since
 				}
-				if time.Since(last) >= info.mgr.idleTimeout/2 {
+				if time.Since(last) >= info.mgr.idleTimeout/4 {
 					info._send(allocBytes(0))
 				}
 			}

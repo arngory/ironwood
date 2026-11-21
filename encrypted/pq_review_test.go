@@ -270,9 +270,9 @@ func TestPQOffDropsSessions(t *testing.T) {
 // one with traffic stays.
 func TestPQStickyEviction(t *testing.T) {
 	pc := newBarePC(t)
-	var logged []string
+	var log logSink
 	cfg := pqOn
-	cfg.Logf = func(f string, args ...any) { logged = append(logged, f) }
+	cfg.Logf = log.f
 	pc.SetPQ(cfg)
 	pc.pq.stickyMax = 3
 	k1, k2, k3, k4 := newPeerEd(t), newPeerEd(t), newPeerEd(t), newPeerEd(t)
@@ -285,8 +285,9 @@ func TestPQStickyEviction(t *testing.T) {
 		t.Fatalf("held to PQ: k1 (traffic) %v, k2 (oldest handshake) %v, k3 %v, k4 %v",
 			pc.pq.required(&k1), pc.pq.required(&k2), pc.pq.required(&k3), pc.pq.required(&k4))
 	}
-	if len(logged) != 1 || !strings.Contains(logged[0], "no longer held") {
-		t.Fatalf("log: %q", logged)
+	logSync(pc)
+	if lines := log.all(); len(lines) != 1 || !strings.Contains(lines[0], "no longer held") {
+		t.Fatalf("log: %q", lines)
 	}
 }
 
@@ -371,6 +372,7 @@ func TestPQRollbackTaken(t *testing.T) {
 		t.Fatalf("nothing in 20 s: B %s, A %s", session(b, a), session(a, b))
 	}
 	t.Logf("the first packet after %v", time.Since(start).Round(10*time.Millisecond))
+	logSync(b.pc)
 	mu.Lock()
 	defer mu.Unlock()
 	found := false

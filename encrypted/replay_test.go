@@ -170,3 +170,26 @@ func TestReplayWindowAgainstModel(t *testing.T) {
 		}
 	}
 }
+
+// through: every nonce up to n seen, the ones after it not; the window moves on from there as from a commit
+func TestReplayThrough(t *testing.T) {
+	for _, n := range []uint64{1, 63, 64, 100, 127, 128, 9000} {
+		var w replayWindow
+		w.reset()
+		w.through(n)
+		for _, seen := range []uint64{0, 1, n / 2, n - 1, n} {
+			if seen <= n && w.check(seen) {
+				t.Fatalf("through(%d): %d not seen", n, seen)
+			}
+		}
+		for _, next := range []uint64{n + 1, n + 2, n + 64, n + 1000} {
+			if !w.check(next) {
+				t.Fatalf("through(%d): %d seen", n, next)
+			}
+		}
+		w.commit(n + 2)
+		if !w.check(n+1) || w.check(n+2) || w.check(n) {
+			t.Fatalf("through(%d), then %d committed: %d %v, %d %v, %d %v", n, n+2, n+1, w.check(n+1), n+2, w.check(n+2), n, w.check(n))
+		}
+	}
+}

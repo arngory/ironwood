@@ -33,17 +33,22 @@ type PQConfig struct {
 	// time it was held. Its PQ traffic (under the key of its session) and its newer keys move that on. Nil: none.
 	Required func(key ed25519.PublicKey) bool
 	// Logf takes the warnings: a PQInfo refused by its time (with the difference of the clocks), a key with a lower
-	// number taken after a restart, a key held to PQ that asks for classic, a PQ session that did not come up. Nil:
-	// none.
+	// number taken after a restart, a key held to PQ that asks for classic, a PQ session that did not come up. It is
+	// called from a goroutine of its own, after the event (it may call into the PacketConn); past 64 lines waiting,
+	// lines are dropped, and their number logged. Nil: none.
 	Logf func(format string, args ...any)
 	// SessionMax is the most PQ sessions up, with traffic opened under them or not, for this node to start a PQ one
 	// with a peer that may be classic: past it, a new peer gets a classic session (a line in the log). Each PQ session
-	// holds some 18 KB (a classic one 2.4). A peer that starts PQ with us still gets it, and so does a key held to PQ,
-	// up to a hard limit of SessionMax and a quarter of it more (at least 64 more). At the hard limit the PQ session
-	// with nothing opened under it for the longest goes (one of a key held to PQ last), its classic one taking its
-	// place where there is one; with every PQ session in use, the new one is refused (classic where the key may be).
-	// Anyone with keys of its own can fill it with signed PQ inits: memory stays bounded, and new peers that may be
-	// classic get classic sessions meanwhile. PacketConn.PQSessionCount tells how many are up. 0: 2048.
+	// holds some 18 KB (a classic one 3). A peer that starts PQ with us still gets it, and so does a key held to PQ,
+	// and our answer to PQ traffic, up to a hard limit of SessionMax and a quarter of it more (at least 64 more): the
+	// PQ sessions held at once, and their memory (one that goes is let go at once). At the hard limit a PQ session
+	// goes to make room: one nothing opened under yet first, then of the others the one nothing opened under for the
+	// longest (10 s at least), a key held to PQ (sticky or Required) only after every other, and not while anything
+	// opened under it in idleTimeout (a minute); its classic one takes its place where there is one. With every PQ
+	// session in use, the new one is refused (classic where the key may be). Anyone with keys of its own, completing
+	// the handshakes and keeping its sessions in use, can fill the table: new peers that may be classic, and peers
+	// with sessions idle 10 s, get classic sessions meanwhile (PQ again once it stops); peers held to PQ keep theirs
+	// while they are alive. PacketConn.PQSessionCount tells how many are up. 0: 2048.
 	SessionMax int
 }
 
@@ -90,9 +95,14 @@ type pqState struct {
 	// the reply limits of any key, apart: one pushed out loses only when its last reply went
 	limits    map[edPub]*list.Element // of *pqLimit
 	limitsLRU list.List
-	// one bucket for the PQInfos to keys not in peers
-	tokens   float64
-	tokensAt time.Time
+	// the buckets for answers that cost more than what asked for them: to keys with no entry in peers (unknown), and
+	// to keys with one (a signed contact), apart, so that packets claimed from random keys cannot starve the others
+	unknownBucket, knownBucket pqBucket
+	// Logf's lines waiting for its goroutine (logf)
+	logMu      sync.Mutex
+	logQ       []pqLogLine
+	logRunning bool
+	logDropped int
 	// keys a session with must be PQ, the least recently confirmed at the back; one with traffic outlives one with
 	// a handshake alone (stickyKey.traffic)
 	sticky    map[edPub]*list.Element // of *stickyKey
@@ -105,6 +115,28 @@ type pqState struct {
 	upgradeRetry   time.Duration
 	peersMax       int
 }
+
+type pqBucket struct {
+	tokens float64
+	at     time.Time
+}
+
+type pqLogLine struct {
+	logf   func(string, ...any)
+	format string
+	args   []any
+}
+
+// pqAsk: what a PQInfo of ours answers (infoDue)
+type pqAsk int
+
+const (
+	askOwn      pqAsk = iota // our own traffic waits for a session: no token
+	askSigned                // a signed packet of the key's: a token of the known bucket, the key in peers or not
+	askUnsigned              // a packet no one signed, claimed from the key: a token of the bucket its entry says
+)
+
+const pqLogQueue = 64
 
 type stickyKey struct {
 	ed      edPub
@@ -123,7 +155,7 @@ func (s *pqState) init() {
 	s.peers = make(map[edPub]*list.Element)
 	s.limits = make(map[edPub]*list.Element)
 	s.sticky = make(map[edPub]*list.Element)
-	s.tokens = pqUnsolicitedRate
+	s.unknownBucket.tokens, s.knownBucket.tokens = pqUnsolicitedRate, pqUnsolicitedRate
 	s.stickyMax, s.pendingTimeout, s.upgradeRetry, s.peersMax = pqStickyMax, pqPendingTimeout, pqUpgradeRetry, pqPeersMax
 }
 
@@ -268,9 +300,44 @@ func (s *pqState) nextSecretNo() uint64 {
 	return s.secretNo.Add(1)
 }
 
+// logf: a line to Logf, from a goroutine of its own (it may call into the PacketConn, which logf's callers hold:
+// the manager's actor, a session's): queued, at most pqLogQueue waiting, the rest dropped and counted
 func (s *pqState) logf(format string, args ...any) {
-	if cfg := s.cfg.Load(); cfg != nil && cfg.Logf != nil {
-		cfg.Logf(format, args...)
+	cfg := s.cfg.Load()
+	if cfg == nil || cfg.Logf == nil {
+		return
+	}
+	s.logMu.Lock()
+	if len(s.logQ) >= pqLogQueue {
+		s.logDropped++
+		s.logMu.Unlock()
+		return
+	}
+	s.logQ = append(s.logQ, pqLogLine{logf: cfg.Logf, format: format, args: args})
+	start := !s.logRunning
+	s.logRunning = true
+	s.logMu.Unlock()
+	if start {
+		go s.drainLog()
+	}
+}
+
+// drainLog calls Logf with the lines queued, until none waits
+func (s *pqState) drainLog() {
+	for {
+		s.logMu.Lock()
+		if len(s.logQ) == 0 {
+			s.logRunning = false
+			s.logMu.Unlock()
+			return
+		}
+		line, dropped := s.logQ[0], s.logDropped
+		s.logQ, s.logDropped = s.logQ[1:], 0
+		s.logMu.Unlock()
+		if dropped != 0 {
+			line.logf("PQ: %d lines of the log dropped (too many at once)", dropped)
+		}
+		line.logf(line.format, line.args...)
 	}
 }
 
@@ -398,7 +465,7 @@ type pqPeerKey struct {
 	hash     pqHash
 	seq      uint64
 	notAfter uint64
-	hpke     hpke.PublicKey // with the peer's static X25519 key
+	box      boxPub // the peer's static X25519 key, the other half of the hybrid key (hpkeKey)
 }
 
 func newPQPeerKey(ed *edPub, pub *pqPub, seq, notAfter uint64) *pqPeerKey {
@@ -406,11 +473,17 @@ func newPQPeerKey(ed *edPub, pub *pqPub, seq, notAfter uint64) *pqPeerKey {
 	if err != nil {
 		return nil
 	}
-	k := &pqPeerKey{pub: *pub, hash: pub.hash(), seq: seq, notAfter: notAfter}
-	if k.hpke, err = pqHPKEPublic(box, pub); err != nil {
-		return nil
+	k := &pqPeerKey{pub: *pub, hash: pub.hash(), seq: seq, notAfter: notAfter, box: *box}
+	if _, err := k.hpkeKey(); err != nil {
+		return nil // not a key
 	}
 	return k
+}
+
+// hpkeKey: the hybrid key to seal to, made where it is used: parsed, it holds some 8 KB, and the table keeps an entry
+// for each of up to pqPeersMax keys (its bytes, 1.2 KB)
+func (k *pqPeerKey) hpkeKey() (hpke.PublicKey, error) {
+	return pqHPKEPublic(&k.box, &k.pub)
 }
 
 // _peer: ed's entry, made if absent, as the most recently used; only for a key ed signed. Past pqPeersMax, the least
@@ -452,25 +525,26 @@ func (s *pqState) _limit(ed *edPub) *pqLimit {
 	return l
 }
 
-// _token: one of the bucket for unauthenticated asks, if there is one. Under s.mu.
-func (s *pqState) _token(now time.Time) bool {
-	if !s.tokensAt.IsZero() {
-		s.tokens = min(pqUnsolicitedRate, s.tokens+now.Sub(s.tokensAt).Seconds()*pqUnsolicitedRate)
+// take: one token of b, if there is one
+func (b *pqBucket) take(now time.Time) bool {
+	if !b.at.IsZero() {
+		b.tokens = min(pqUnsolicitedRate, b.tokens+now.Sub(b.at).Seconds()*pqUnsolicitedRate)
 	}
-	s.tokensAt = now
-	if s.tokens < 1 {
+	b.at = now
+	if b.tokens < 1 {
 		return false
 	}
-	s.tokens--
+	b.tokens--
 	return true
 }
 
-// tokenDue: a token of the bucket for unauthenticated asks, for a PQ init in reply to a packet no one signed (it is
-// some 25 times its size, and the per-key limits are an LRU that such packets refill)
+// tokenDue: a token of the known bucket, for a PQ init in reply to a packet no one signed, claimed from a key whose
+// ML-KEM key is known here (the init is some 25 times the packet, and the per-key limits are an LRU that such
+// packets refill)
 func (s *pqState) tokenDue() bool {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	return s._token(s.now())
+	return s.knownBucket.take(s.now())
 }
 
 func (s *pqState) _live(k *pqPeerKey, slack time.Duration) bool {
@@ -576,21 +650,30 @@ func (s *pqState) takeRollback(ed *edPub) *pqPeerKey {
 	return k
 }
 
-// infoDue: our PQInfo may go to ed now (at most once in pqInfoInterval; to a key with no entry in peers, or in reply
-// to a packet no one signed (unsigned), only with a token of the bucket for all such asks: the per-key limits are an
-// LRU such packets refill); counts it as sent
-func (s *pqState) infoDue(ed *edPub, unsigned bool) bool {
+// infoDue: our PQInfo may go to ed now, at most once in pqInfoInterval, and with a token where ask says (pqAsk: in
+// reply to a packet no one signed always, of the unknown bucket for a key with no entry in peers, the known one for
+// a key with one; to a signed packet of a key with no entry, of the known bucket); counts it as sent. starved: none
+// went for want of a token.
+func (s *pqState) infoDue(ed *edPub, ask pqAsk) (due, starved bool) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	l, now := s._limit(ed), s.now()
 	if !l.sentInfoAt.IsZero() && now.Sub(l.sentInfoAt) < pqInfoInterval {
-		return false
+		return false, false
 	}
-	if _, known := s.peers[*ed]; (!known || unsigned) && !s._token(now) {
-		return false
+	_, known := s.peers[*ed]
+	switch {
+	case ask == askUnsigned && !known:
+		if !s.unknownBucket.take(now) {
+			return false, true
+		}
+	case ask == askUnsigned || (ask == askSigned && !known):
+		if !s.knownBucket.take(now) {
+			return false, true
+		}
 	}
 	l.sentInfoAt = now
-	return true
+	return true, false
 }
 
 // initReplyDue: an init in reply to ed's traffic (no session, keys not matching, a packet that did not open) may go

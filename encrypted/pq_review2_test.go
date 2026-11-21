@@ -59,6 +59,18 @@ func (l *logSink) count(sub string) (n int) {
 	return
 }
 
+// logSync: pc's Logf (called from a goroutine of its own) has had every line logged so far
+func logSync(pc *PacketConn) {
+	for deadline := time.Now().Add(5 * time.Second); time.Now().Before(deadline); time.Sleep(time.Millisecond) {
+		pc.pq.logMu.Lock()
+		idle := !pc.pq.logRunning
+		pc.pq.logMu.Unlock()
+		if idle {
+			return
+		}
+	}
+}
+
 func (l *logSink) all() []string {
 	l.mu.Lock()
 	defer l.mu.Unlock()
@@ -348,6 +360,7 @@ func TestPQClassicRestored(t *testing.T) {
 					t.Fatal("no upgrade tried again later")
 				}
 			}
+			logSync(n.pc)
 			if c.name == "evicted" && log.count("the most kept: the oldest") != 1 {
 				t.Fatalf("no line of the eviction in the log: %q", log.all())
 			}
@@ -583,6 +596,7 @@ func TestPQStickyEndsAfterOff(t *testing.T) {
 	if hears(a, b, "off, held", 2*time.Second) || hears(b, a, "off, held back", time.Second) {
 		t.Fatal("traffic went with a key held to PQ, its PQ sessions off")
 	}
+	logSync(b.pc)
 	if logB.count("a classic init from") != 1 {
 		t.Fatalf("B's log: %q", logB.all())
 	}
@@ -658,11 +672,13 @@ func TestPQStickyAsksClassicLogged(t *testing.T) {
 		phony.Block(&n.pc.sessions, func() {})
 	}
 	deliver(classicInitFrom(t, other, n.pc)) // signed by another key
+	logSync(n.pc)
 	if got := log.count("from"); got != 0 {
 		t.Fatalf("a forged classic init logged: %q", log.all())
 	}
 	deliver(classicInitFrom(t, peer, n.pc))
 	deliver(classicInitFrom(t, peer, n.pc))
+	logSync(n.pc)
 	if got := log.count("a classic init from"); got != 1 {
 		t.Fatalf("%d lines for two classic inits at once, want 1: %q", got, log.all())
 	}
@@ -670,10 +686,12 @@ func TestPQStickyAsksClassicLogged(t *testing.T) {
 	traffic := make([]byte, sessionTrafficOverheadMin)
 	traffic[0] = sessionTypeTraffic
 	deliver(traffic)
+	logSync(n.pc)
 	if got := len(log.all()); got != 1 {
 		t.Fatalf("classic traffic no one signed logged: %q", log.all())
 	}
 	deliver(classicInitFrom(t, peer, n.pc))
+	logSync(n.pc)
 	if got := log.count("a classic init from"); got != 2 {
 		t.Fatalf("a classic init once the interval passed: %d lines in all: %q", got, log.all())
 	}
@@ -795,6 +813,7 @@ func TestPQSessionMax(t *testing.T) {
 	if session(n, &pqNode{pub: p3.publicEd[:]}) != "classic" {
 		t.Fatal("no classic session past SessionMax")
 	}
+	logSync(n.pc)
 	if log.count("(PQConfig.SessionMax): none started") != 1 {
 		t.Fatalf("log: %q", log.all())
 	}
@@ -827,6 +846,8 @@ func TestPQProbeRollsBack(t *testing.T) {
 		}
 	}
 	waitSessions(t, a, b, "classic", 3*time.Second)
+	logSync(a.pc)
+	logSync(b.pc)
 	for i := range logs {
 		if logs[i].count("no PQ packet of its opened here") != 1 {
 			t.Fatalf("log of %d: %q", i, logs[i].all())
@@ -1100,6 +1121,7 @@ func TestPQRequiredNoInfoLogged(t *testing.T) {
 	if hears(a, b, "must be PQ", 2*time.Second) {
 		t.Fatal("traffic went with no PQInfo of a key that must be PQ")
 	}
+	logSync(a.pc)
 	if log.count("must be PQ, and no PQInfo of it came") != 1 {
 		t.Fatalf("log: %q", log.all())
 	}

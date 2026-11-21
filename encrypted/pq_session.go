@@ -108,6 +108,9 @@ func (init *pqInit) decrypt(pc *PacketConn, from *edPub, data []byte) (ok, unkno
 	offset = bytesPop(init.next[:], payload, offset)
 	init.keySeq = binary.BigEndian.Uint64(payload[offset:])
 	init.seq = binary.BigEndian.Uint64(payload[offset+8:])
+	if init.seq == 0 {
+		return false, false // no session began at 0 (see sessionInit.decrypt)
+	}
 	signed := append(pqBinding(pqInitSigCtx, msgType, from, &pc.publicEd, seq, &own.hash), payload[edSigSize:]...)
 	return edCheck(signed, &sig, from, pc.groupAuth.preimage()), false
 }

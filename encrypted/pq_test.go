@@ -514,3 +514,42 @@ func TestInitReplyLimited(t *testing.T) {
 		t.Fatal("no init in reply after the interval")
 	}
 }
+
+// TestInitSeqZeroRefused: an init of seq 0, classic or PQ, does not open. A new session takes seq-1 as its last, and 0
+// wrapped it to the top: every later init was old, and a PQ session stayed without a secret of ours, its first re-init
+// a panic (own[0]). No session begins at 0: seq is the time it began.
+func TestInitSeqZeroRefused(t *testing.T) {
+	a, b := newBarePC(t), newBarePC(t)
+	cur, _ := newBoxKeys()
+	next, _ := newBoxKeys()
+	for _, seq := range []uint64{0, 5} {
+		init := newSessionInit(&cur, &next, 1)
+		init.seq = seq
+		data, err := init.encrypt(&a.secretEd, &b.publicEd, a.groupAuth)
+		if err != nil {
+			t.Fatal(err)
+		}
+		var got sessionInit
+		if ok := got.decrypt(&b.secretBox, &a.publicEd, data, b.groupAuth); ok != (seq != 0) {
+			t.Fatalf("a classic init of seq %d: opened %v", seq, ok)
+		}
+
+		secret := newRatchetSecret()
+		pqi := newPQInit(&cur, &next, 1, &secret, 1)
+		pqi.seq = seq
+		pqData, err := pqi.encrypt(a, sessionTypePQInit, &b.publicEd, ownAsPeer(t, b))
+		if err != nil {
+			t.Fatal(err)
+		}
+		var gotPQ pqInit
+		if ok, _ := gotPQ.decrypt(b, &a.publicEd, pqData); ok != (seq != 0) {
+			t.Fatalf("a PQ init of seq %d: opened %v", seq, ok)
+		}
+	}
+
+	// and a PQ session with no secret of ours sends nothing, rather than taking own[0]
+	info := newSession(&a.publicEd, cur, next, 5)
+	info.pq = true
+	info._sendInit()
+	info._sendAck()
+}

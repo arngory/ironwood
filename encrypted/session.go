@@ -606,6 +606,9 @@ func (info *sessionInfo) doRecv(from phony.Actor, msg []byte) {
 
 func (info *sessionInfo) _sendInit() {
 	if info.pq {
+		if len(info.own) == 0 {
+			return // no secret of ours yet (the session waits for its handshake): nothing to init with
+		}
 		// our newest secret again: a re-init keeps it (the peer may key to it already)
 		own := info.own[0]
 		init := newPQInit(&info.sendPub, &info.nextPub, info.localKeySeq, &own.secret, own.no)
@@ -625,6 +628,9 @@ func (info *sessionInfo) _sendInitDue() {
 
 func (info *sessionInfo) _sendAck() {
 	if info.pq {
+		if len(info.own) == 0 {
+			return
+		}
 		own := info.own[0]
 		ack := newPQInit(&info.sendPub, &info.nextPub, info.localKeySeq, &own.secret, own.no)
 		info.pqAck = &ack // sent again, the same, to a repeat of the init it answers (handleInit)
@@ -778,6 +784,10 @@ func (init *sessionInit) decrypt(priv *boxPriv, from *edPub, data []byte, auth g
 	init.keySeq = binary.BigEndian.Uint64(payload[offset : offset+8])
 	offset += 8
 	init.seq = binary.BigEndian.Uint64(payload[offset:])
+	if init.seq == 0 {
+		// a session's seq is the time it began: 0 is no one's, and seq-1 of a new session would wrap to the top
+		return false
+	}
 	// Check signature
 	var sigBytes []byte
 	sigBytes = append(sigBytes, fromBox[:]...)

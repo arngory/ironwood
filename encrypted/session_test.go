@@ -404,3 +404,103 @@ func (c *lossyConn) RemoteAddr() net.Addr               { return nil }
 func (c *lossyConn) SetDeadline(t time.Time) error      { return nil }
 func (c *lossyConn) SetReadDeadline(t time.Time) error  { return nil }
 func (c *lossyConn) SetWriteDeadline(t time.Time) error { return nil }
+
+// TestShortTrafficDropped: a session's peer sends traffic whose varints are 10 bytes each (binary.Uvarint takes any
+// length up to 10, the minimal one or not) and whose sealed text is 5 bytes. The size check counted a byte a varint,
+// so the packet passed it, opened, and its 32-byte next key was sliced out of 5 bytes: a panic in the session's
+// actor, the whole process down. It is dropped now, and the session goes on.
+func TestShortTrafficDropped(t *testing.T) {
+	pubA, privA, _ := ed25519.GenerateKey(nil)
+	pubB, privB, _ := ed25519.GenerateKey(nil)
+	a, _ := NewPacketConn(privA)
+	defer a.Close()
+	b, _ := NewPacketConn(privB)
+	defer b.Close()
+	cA, cB := newLossyLink(nil)
+	defer cA.Close()
+	go a.HandleConn(pubB, cA, 0)
+	go b.HandleConn(pubA, cB, 0)
+	addrB := types.Addr(pubB)
+	warmPaths(t, a, b, pubA, pubB)
+	go func() {
+		buf := make([]byte, 64)
+		for {
+			if _, _, err := a.ReadFrom(buf); err != nil {
+				return
+			}
+		}
+	}()
+	heard := make(chan string, 16)
+	go func() {
+		buf := make([]byte, 64)
+		for {
+			n, _, err := b.ReadFrom(buf)
+			if err != nil {
+				return
+			}
+			heard <- string(buf[:n])
+		}
+	}()
+	for deadline := time.Now().Add(5 * time.Second); ; {
+		a.WriteTo([]byte("hello"), addrB)
+		select {
+		case <-heard:
+		case <-time.After(250 * time.Millisecond):
+			if time.Now().After(deadline) {
+				t.Fatal("no handshake in 5 s")
+			}
+			continue
+		}
+		break
+	}
+
+	// a traffic packet as A's session would seal one, its three varints at 10 bytes each and 5 bytes inside
+	var pkt []byte
+	phony.Block(&a.sessions, func() {
+		info := a.sessions.sessions[*(*edPub)(pubB)]
+		if info == nil {
+			t.Error("no session of A to B")
+			return
+		}
+		phony.Block(info, func() {
+			info.sendNonce++
+			long := func(v uint64) []byte {
+				out := make([]byte, 10)
+				for i := 0; i < 9; i++ {
+					out[i] = byte(v&0x7f) | 0x80
+					v >>= 7
+				}
+				out[9] = byte(v)
+				return out
+			}
+			bs := []byte{sessionTypeTraffic}
+			bs = append(bs, long(info.localKeySeq)...)
+			bs = append(bs, long(info.remoteKeySeq)...)
+			bs = append(bs, long(info.sendNonce)...)
+			pkt = boxSeal(bs, []byte("short"), info.sendNonce, &info.sendShared)
+		})
+	})
+	if pkt == nil {
+		t.FailNow()
+	}
+	if n := len(pkt); n != 1+30+boxOverhead+5 {
+		t.Fatalf("the packet is %d bytes", n)
+	}
+	a.PacketConn.WriteTo(pkt, addrB)
+
+	// B is still there, and the session still carries what A sends
+	for deadline := time.Now().Add(3 * time.Second); ; {
+		a.WriteTo([]byte("after"), addrB)
+		select {
+		case msg := <-heard:
+			if msg == "after" {
+				return
+			}
+			continue
+		case <-time.After(250 * time.Millisecond):
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("nothing heard after the short packet")
+		}
+	}
+}

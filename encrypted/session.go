@@ -262,7 +262,14 @@ func (info *sessionInfo) _resetTimer() {
 
 func (info *sessionInfo) handleInit(from phony.Actor, init *sessionInit) {
 	info.Act(from, func() {
-		if init.seq <= info.seq {
+		if init.seq < info.seq {
+			return
+		}
+		if init.seq == info.seq {
+			// The same init again: its sender has not had our ack, which may have gone out before we had a path back
+			// (and the lookup for one was lost), or got lost on the way. Ack it again, the session as it is: the ack's
+			// traffic looks the path up anew. Ignored, the contact would wait for this session to time out.
+			info._sendAck()
 			return
 		}
 		info._handleUpdate(init)

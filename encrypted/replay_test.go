@@ -3,6 +3,7 @@ package encrypted
 import (
 	"math/rand"
 	"testing"
+	"time"
 )
 
 // reference model: a set of seen nonces plus a high-water mark,
@@ -171,6 +172,30 @@ func TestReplayWindowAgainstModel(t *testing.T) {
 	}
 }
 
+// TestReplayResetAtThrough: resetAt as a ratchet step uses it, every nonce up to n seen and the ones after it not;
+// the window moves on from there as from a commit
+func TestReplayResetAtThrough(t *testing.T) {
+	for _, n := range []uint64{1, 63, 64, 100, 127, 128, 9000} {
+		var w replayWindow
+		w.reset()
+		w.resetAt(n)
+		for _, seen := range []uint64{0, 1, n / 2, n - 1, n} {
+			if seen <= n && w.check(seen) {
+				t.Fatalf("resetAt(%d): %d not seen", n, seen)
+			}
+		}
+		for _, next := range []uint64{n + 1, n + 2, n + 64, n + 1000} {
+			if !w.check(next) {
+				t.Fatalf("resetAt(%d): %d seen", n, next)
+			}
+		}
+		w.commit(n + 2)
+		if !w.check(n+1) || w.check(n+2) || w.check(n) {
+			t.Fatalf("resetAt(%d), then %d committed: %d %v, %d %v, %d %v", n, n+2, n+1, w.check(n+1), n+2, w.check(n+2), n, w.check(n))
+		}
+	}
+}
+
 // TestReplayWindowResetAt: after resetAt(floor) every nonce up to floor is taken for seen, as under a strict mark, and
 // every nonce above it is taken once, in any order.
 func TestReplayWindowResetAt(t *testing.T) {
@@ -246,10 +271,12 @@ func TestReinitKeepsReplay(t *testing.T) {
 	cur, _ := newBoxKeys()
 	next, _ := newBoxKeys()
 	info := newSession(&ed, cur, next, 1)
+	info.mgr = &sessionManager{idleTimeout: time.Hour} // the update resets the session's timer (pq-sessions)
+	defer func() { info.timer.Stop() }()
 	info.nextSendNonce = 37 // the peer's packets taken under the next key
 	newNext, _ := newBoxKeys()
 	init := newSessionInit(&next, &newNext, 2)
-	info._handleUpdate(&init)
+	info._handleUpdate(&init, nil, true) // a peer's init, as handleInit takes it
 	for n := uint64(0); n <= 37; n++ {
 		if info.recvWindow.check(n) {
 			t.Fatalf("nonce %d, taken under the next key before the init, open again", n)

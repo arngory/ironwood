@@ -22,6 +22,7 @@ import (
 // lookup lost while the tree converges never brings). The sender resends the same init with each packet; the receiver must
 // ack it again, or the contact waits for the receiver's session to time out (sessionTimeout, a minute).
 func TestRepeatedInitIsAckedAgain(t *testing.T) {
+	t.Parallel()
 	pubA, privA, _ := ed25519.GenerateKey(nil)
 	pubB, privB, _ := ed25519.GenerateKey(nil)
 	a, err := NewPacketConn(privA)
@@ -112,6 +113,7 @@ func TestRepeatedInitIsAckedAgain(t *testing.T) {
 // ack, and an ack of the first time would be dropped by its seq. A fresh ack to each replay would ratchet the
 // sender's keys, one replay a second keeping the session renegotiating.
 func TestReplayedInitKeepsKeys(t *testing.T) {
+	t.Parallel()
 	pubA, privA, _ := ed25519.GenerateKey(nil)
 	pubB, privB, _ := ed25519.GenerateKey(nil)
 	a, _ := NewPacketConn(privA)
@@ -198,6 +200,7 @@ func TestReplayedInitKeepsKeys(t *testing.T) {
 // gone) both arrive. A strict high-water mark of nonces lost the first, an older nonce than one already taken; the
 // replay window takes it, once.
 func TestReorderedTrafficArrives(t *testing.T) {
+	t.Parallel()
 	pubA, privA, _ := ed25519.GenerateKey(nil)
 	pubB, privB, _ := ed25519.GenerateKey(nil)
 	a, _ := NewPacketConn(privA)
@@ -410,6 +413,7 @@ func (c *lossyConn) SetWriteDeadline(t time.Time) error { return nil }
 // so the packet passed it, opened, and its 32-byte next key was sliced out of 5 bytes: a panic in the session's
 // actor, the whole process down. It is dropped now, and the session goes on.
 func TestShortTrafficDropped(t *testing.T) {
+	t.Parallel()
 	pubA, privA, _ := ed25519.GenerateKey(nil)
 	pubB, privB, _ := ed25519.GenerateKey(nil)
 	a, _ := NewPacketConn(privA)
@@ -502,5 +506,71 @@ func TestShortTrafficDropped(t *testing.T) {
 		if time.Now().After(deadline) {
 			t.Fatal("nothing heard after the short packet")
 		}
+	}
+}
+
+// BenchmarkClassicTraffic: a classic session (PQ off), one message at a time from A to B, end to end: its
+// allocations a message are base's (60 on 898a313).
+func BenchmarkClassicTraffic(b *testing.B) {
+	pubA, privA, _ := ed25519.GenerateKey(nil)
+	pubB, privB, _ := ed25519.GenerateKey(nil)
+	a, _ := NewPacketConn(privA)
+	defer a.Close()
+	c, _ := NewPacketConn(privB)
+	defer c.Close()
+	cA, cB := newLossyLink(nil)
+	defer cA.Close()
+	go a.HandleConn(pubB, cA, 0)
+	go c.HandleConn(pubA, cB, 0)
+	hasPath := func(pc *PacketConn, key ed25519.PublicKey) bool {
+		for _, p := range pc.PacketConn.Debug.GetPaths() {
+			if bytes.Equal(p.Key, key) {
+				return true
+			}
+		}
+		return false
+	}
+	for !hasPath(a, pubB) || !hasPath(c, pubA) {
+		a.PacketConn.WriteTo([]byte{0}, types.Addr(pubB))
+		c.PacketConn.WriteTo([]byte{0}, types.Addr(pubA))
+		time.Sleep(50 * time.Millisecond)
+	}
+	got := make(chan struct{}, 1024)
+	go func() {
+		buf := make([]byte, 4096)
+		for {
+			if _, _, err := c.ReadFrom(buf); err != nil {
+				return
+			}
+			got <- struct{}{}
+		}
+	}()
+	go func() {
+		buf := make([]byte, 4096)
+		for {
+			if _, _, err := a.ReadFrom(buf); err != nil {
+				return
+			}
+		}
+	}()
+	msg := make([]byte, 1000)
+	addrB := types.Addr(pubB)
+	for ready := false; !ready; {
+		a.WriteTo(msg, addrB)
+		select {
+		case <-got:
+			ready = true
+		case <-time.After(100 * time.Millisecond):
+		}
+	}
+	time.Sleep(200 * time.Millisecond)
+	for len(got) > 0 {
+		<-got
+	}
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		a.WriteTo(msg, addrB)
+		<-got
 	}
 }

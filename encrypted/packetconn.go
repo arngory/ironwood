@@ -109,9 +109,15 @@ func (pc *PacketConn) SetPQ(cfg PQConfig) {
 	if cfg.Enabled {
 		pc.pqOwn() // the process's ML-KEM key, made now rather than on the first contact
 	}
+	wasAnswerOnly := pc.pq.answerOnly()
 	pc.pq.cfg.Store(&cfg)
-	if !cfg.Enabled {
+	switch {
+	case !cfg.Enabled:
 		pc.sessions.dropPQ()
+	case wasAnswerOnly && !cfg.AnswerOnly:
+		// back from answer only: the classic sessions are upgraded later, as after a lost init of ours (spread over
+		// pqUpgradeRetry, not all at once). Into answer only nothing goes: the PQ sessions up stay
+		pc.sessions.upgradeClassic()
 	}
 }
 

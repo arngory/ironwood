@@ -132,6 +132,17 @@ func (mgr *sessionManager) _openedWithin(info *sessionInfo, d time.Duration) boo
 	return at != 0 && mgr.pc.pq.now().UnixNano()-at < int64(d)
 }
 
+// upgradeClassic: each classic session up is upgraded later (_upgradeLater), PQ back from answer only
+func (mgr *sessionManager) upgradeClassic() {
+	mgr.Act(nil, func() {
+		for k, info := range mgr.sessions {
+			if !info.pq {
+				mgr._upgradeLater(k)
+			}
+		}
+	})
+}
+
 // dropPQ forgets the PQ sessions and the PQ inits under way (PQ turned off): the next packet starts a classic one
 func (mgr *sessionManager) dropPQ() {
 	phony.Block(mgr, func() {

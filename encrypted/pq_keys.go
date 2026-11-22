@@ -25,6 +25,14 @@ import (
 // delivered, as upstream does.
 type PQConfig struct {
 	Enabled bool
+	// AnswerOnly: PQ in answer only. This node starts no PQ session itself: no PQInfo of its own to upgrade a classic
+	// session, no PQ init for its own data or a later upgrade. A PQ session a peer starts is answered as with PQ on
+	// (its PQ init, ack and traffic, our PQ init in reply to its PQ traffic with no session), and the node's ML-KEM key
+	// is still announced in reply to the peer's PQ packets, so that a peer holding this node to PQ keeps its session.
+	// A key held to PQ here (Required, or sticky) is the exception: with it the node starts PQ as with PQ on, or there
+	// would be no session at all. A way back from PQ without a break: the peers held to it stay PQ, the others classic.
+	// Ignored while Enabled is false.
+	AnswerOnly bool
 	// Required reports the keys a session with must be PQ: classic init, ack and traffic from them are dropped,
 	// and none goes to them. Others are "where possible": classic at once, PQ in its place once both ends know each
 	// other's ML-KEM key. A key that had a PQ session in this process (a PQ packet of it opened, or its verified PQ
@@ -171,6 +179,18 @@ func (s *pqState) config() *PQConfig {
 
 func (s *pqState) enabled() bool {
 	return s.config() != nil
+}
+
+// initiates: this node may start a PQ session with key itself: PQ on, and not in answer only unless key is held to PQ
+func (s *pqState) initiates(key *edPub) bool {
+	cfg := s.config()
+	return cfg != nil && (!cfg.AnswerOnly || s.required(key))
+}
+
+// answerOnly: PQ on, in answer only (PQConfig.AnswerOnly)
+func (s *pqState) answerOnly() bool {
+	cfg := s.config()
+	return cfg != nil && cfg.AnswerOnly
 }
 
 // required: a session with key must be PQ (always false while PQ is off)

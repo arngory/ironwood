@@ -213,6 +213,9 @@ func (mgr *sessionManager) _maybeStartPQ(pub *edPub) {
 		}
 		return
 	}
+	if !mgr.pc.pq.initiates(pub) {
+		return // answer only: neither our PQ init nor our PQInfo, which would have the peer start one
+	}
 	info := mgr.sessions[*pub]
 	if info != nil && info.pq {
 		return

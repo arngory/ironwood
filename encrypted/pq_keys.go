@@ -145,7 +145,7 @@ type pqAsk int
 
 const (
 	askOwn      pqAsk = iota // our own traffic waits for a session: no token
-	askSigned                // a signed packet of the key's: the known bucket's token for a key in peers, the signed bucket's else
+	askSigned                // a signed packet of the key's: no token for a key in peers, the signed bucket's else
 	askUnsigned              // a packet no one signed, claimed from the key: a token of the bucket its entry says
 	askSealed                // a PQ init or ack sealed to an ML-KEM key of ours not taken: twice our answer, no token
 )
@@ -695,9 +695,9 @@ func (s *pqState) answerDue(ed *edPub) bool {
 }
 
 // infoDue: our PQInfo may go to ed now, at most once in pqInfoInterval, and with a token where ask says (pqAsk: in
-// reply to a packet no one signed always, of the unknown bucket for a key with no entry in peers, the known one for
-// a key with one; to a signed packet of a key with no entry, of the known bucket); counts it as sent. starved: none
-// went for want of a token.
+// reply to a packet no one signed, of the unknown bucket for a key with no entry in peers, the known one for a key
+// with one; to a signed packet of a key with no entry, of the signed bucket; none for a signed packet of a key in
+// peers, our own data or a sealed init); counts it as sent. starved: none went for want of a token.
 func (s *pqState) infoDue(ed *edPub, ask pqAsk) (due, starved bool) {
 	s.mu.Lock()
 	defer s.mu.Unlock()

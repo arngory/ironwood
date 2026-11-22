@@ -673,7 +673,7 @@ func (mgr *sessionManager) _upgradeAfter(pub edPub, d time.Duration) {
 }
 
 // _countUnconfirmed keeps the PQ sessions no traffic opened under yet within pqUnconfirmedMax: each weighs some 12.4 KB
-// (a classic one 2.4), and anyone with a key of its own makes one with a PQ init. Past the limit, those confirmed
+// (a classic one 3.2), and anyone with a key of its own makes one with a PQ init. Past the limit, those confirmed
 // or gone since leave the count, then the oldest of the rest is dropped.
 func (mgr *sessionManager) _countUnconfirmed(info *sessionInfo) {
 	mgr.pqUnconfirmed[info.ed] = info

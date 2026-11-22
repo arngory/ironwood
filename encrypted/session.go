@@ -545,7 +545,6 @@ type sessionInfo struct {
 	lastOpened   time.Time
 	stickyAt     time.Time    // the key marked sticky by traffic of this session, last (pq.now)
 	sentAt       time.Time    // a PQ packet of ours sent under it, last
-	initCurrent  boxPub       // the peer's current key in the last init or ack taken
 	seqCurrents  []boxPub     // R5-2: the peer's current keys of each init or ack taken at seq
 	confirmed    atomic.Bool  // a PQ packet opened (read by the manager)
 	openedAt     atomic.Int64 // then, last (pq.now, Unix nanoseconds; read by the manager)
@@ -682,7 +681,6 @@ func (info *sessionInfo) _handleUpdate(init *sessionInit, pqi *pqInit, answering
 	}
 	info.current = init.current
 	info.next = init.next
-	info.initCurrent = init.current
 	if init.seq != info.seq {
 		info.seqCurrents = info.seqCurrents[:0]
 	}

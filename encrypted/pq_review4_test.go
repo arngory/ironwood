@@ -528,7 +528,7 @@ func TestPQKeepaliveRate(t *testing.T) {
 	s, _ := streamCount(a, b, "one way", 3*time.Second)
 	b.tap.Store(nil)
 	if got := sent.Load(); got < 6 || got > 24 {
-		t.Fatalf("the reader of a one-way flow (%d packets in 3 s, idleTimeout 1 s) sent %d PQ packets, want about 12", s, got)
+		t.Fatalf("the reader of a one-way flow (%d packets in 3 s, idleTimeout 2 s) sent %d PQ packets, want 6 to 24", s, got)
 	}
 }
 

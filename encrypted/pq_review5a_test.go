@@ -258,6 +258,10 @@ func TestR5ScanCost(t *testing.T) {
 	}})
 	hard := n.pc.pq.hardMax()
 	n.pc.sessions.unconfirmedMax = hard + 10
+	// the sessions' idle timer (wall clock, set at each session's start, not reset by inUse): fill takes some 30 ms
+	// an init under -race, and past idleTimeout (a minute) the first sessions would go while the last are made, the
+	// count stuck short of hard (R7-S). Set before any session, as unconfirmedMax
+	n.pc.sessions.idleTimeout = time.Hour
 	keys := fill(t, n, hard)
 	inUse(n, keys)
 	p := lightPC(t)

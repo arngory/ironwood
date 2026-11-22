@@ -1275,8 +1275,10 @@ func TestPQOwnDataNoToken(t *testing.T) {
 	}
 }
 
-// A PQ init of ours sent once in reply to a packet no one signed gives way to the peer's, crossed, though ours is the
-// lower key's: ours may have been lost, and is not sent again on its own.
+// A PQ init of ours sent once in reply to a packet no one signed, the lower key's, goes on when the peer's crosses it,
+// as one we started does: the peer gives way to it, and had ours given way too, each end would answer the other
+// (R6A-4). Ours may have been lost (N-R4-1): it goes again at once, the same bytes, and stays once; a second crossing
+// within half pqInitRetry sends nothing more.
 func TestPQOnceYieldsUnit(t *testing.T) {
 	n := newPQNode(t, pqOn) // no link
 	var p *PacketConn
@@ -1289,12 +1291,18 @@ func TestPQOnceYieldsUnit(t *testing.T) {
 	k := edOf(p)
 	knows(t, n.pc, p)
 	phony.Block(&n.pc.sessions, func() { n.pc.sessions._startPQ(&k, n.pc.pq.usableKey(&k), true) })
-	acks := n.sent[sessionTypePQAck].Load()
+	acks, inits := n.sent[sessionTypePQAck].Load(), n.sent[sessionTypePQInit].Load()
 	deliverTo(n, k, pqInitFrom(t, p, n.pc))
-	var pending bool
-	phony.Block(&n.pc.sessions, func() { pending = n.pc.sessions.pqPending[k] != nil })
-	if pending || n.sent[sessionTypePQAck].Load() != acks+1 {
-		t.Fatalf("ours sent once, the peer's crossed: ours kept %v, %d acks to the peer's", pending, n.sent[sessionTypePQAck].Load()-acks)
+	deliverTo(n, k, pqInitFrom(t, p, n.pc))
+	var pending, once bool
+	phony.Block(&n.pc.sessions, func() {
+		if q := n.pc.sessions.pqPending[k]; q != nil {
+			pending, once = true, q.once
+		}
+	})
+	if !pending || !once || n.sent[sessionTypePQAck].Load() != acks || n.sent[sessionTypePQInit].Load() != inits+1 {
+		t.Fatalf("ours sent once, the peer's crossed twice: ours kept %v (once %v), %d acks to the peer's, ours sent again %d times (want kept, once, 0, 1)",
+			pending, once, n.sent[sessionTypePQAck].Load()-acks, n.sent[sessionTypePQInit].Load()-inits)
 	}
 }
 

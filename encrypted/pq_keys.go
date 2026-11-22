@@ -618,8 +618,9 @@ func (s *pqState) accept(ed *edPub, pub *pqPub, seq, notAfter uint64) (accepted,
 	case p.key == nil || seq > p.key.seq:
 		if k := newPQPeerKey(ed, pub, seq, notAfter); k != nil {
 			p.key, p.rollback = k, nil
-			if held := s._held(ed); held != nil {
-				held.until = max(held.until, s._holdUntil(notAfter)) // a newer key of a sticky one: held to PQ for it
+			if held := s._held(ed); held != nil && !s.answerOnly() {
+				// a newer key of a sticky one: held to PQ for it (not in answer only, where no hold is moved on, R7-1)
+				held.until = max(held.until, s._holdUntil(notAfter))
 			}
 			return true, true
 		}

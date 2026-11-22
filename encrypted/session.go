@@ -934,7 +934,7 @@ func (info *sessionInfo) doRecv(from phony.Actor, msg []byte) {
 		default:
 			// We can't make sense of their message
 			// Send a sessionInit and hope they ack so we can fix things
-			info._sendInitDue()
+			info._sendInitFailed()
 			return
 		}
 		// Decrypt and handle packet
@@ -1005,7 +1005,7 @@ func (info *sessionInfo) doRecv(from phony.Actor, msg []byte) {
 			// Keys somehow became out-of-sync
 			// This seems to happen in some edge cases if a node restarts
 			// Fix by sending a new init
-			info._sendInitDue()
+			info._sendInitFailed()
 		}
 	})
 }
@@ -1023,6 +1023,18 @@ func (info *sessionInfo) _sendInit() {
 	}
 	init := newSessionInit(&info.sendPub, &info.nextPub, info.localKeySeq)
 	info.mgr.sendInit(&info.ed, &init)
+}
+
+// _sendInitFailed: an init in reply to a packet of the peer's that did not open (keys out of step), as
+// _sendInitDue. Not from a PQ session under which a packet opened within pqStaleGrace: that one is in step, and the
+// packet is not one of the peer's now (forged, or late from before a re-init); each would have us seal and send a PQ
+// re-init (2.5 KB) to the peer for some 53 B that anyone can send, outside the bucket of the other answers to a
+// packet no one signed (R7-2). A session that is out of step opens nothing, and its re-init goes once that is so.
+func (info *sessionInfo) _sendInitFailed() {
+	if info.pq && !info.lastOpened.IsZero() && time.Since(info.lastOpened) < pqStaleGrace {
+		return
+	}
+	info._sendInitDue()
 }
 
 // _sendInitDue: an init in reply to the peer's traffic, at most once in initReplyInterval

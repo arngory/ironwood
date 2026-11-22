@@ -127,7 +127,6 @@ func TestR6OnceSwallowsRetry(t *testing.T) {
 // R6A-4 probe: two once-pendings cross (forged 0x13 to each end, claimed from the other, both with a classic
 // session and the other's ML-KEM key): both give way, both answer. Do the ends end up with a working PQ session?
 func TestR6BothOnceCross(t *testing.T) {
-	t.Skip("R6A-4: crossed once-inits lose some 2.5 s a->b, then heal; its optional fix breaks N-R4-1 (TestPQOnceYieldsUnit) and is not taken")
 	t.Parallel()
 	a, b := newPQNode(t, PQConfig{}), newPQNode(t, PQConfig{})
 	linkPQ(t, a, b)

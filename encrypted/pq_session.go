@@ -136,7 +136,8 @@ type pqPending struct {
 	timer       *time.Timer
 	// once: sent in reply to a packet no one signed, not again on its own (_replyPQInit): each retry would be 2.5 KB
 	// out for the one packet
-	once bool
+	once     bool
+	resentAt time.Time // once: sent again to a crossing init of the peer's, last (R6A-4)
 }
 
 // pqRefusesClassic: classic init, ack and traffic from key are dropped (it must be PQ, or a PQ session with it is up)
@@ -468,10 +469,22 @@ func (mgr *sessionManager) _handlePQInit(pub *edPub, data []byte, isAck bool) {
 		// two PQ inits crossed: the one of the end with the lower key goes on, the other end answers it. Both
 		// answered, each end's ack would be one its peer's session (made from the other init, the same second)
 		// takes for a repeat, and the two ratchets would part.
-		if !p.once && bytes.Compare(mgr.pc.publicEd[:], pub[:]) < 0 {
+		if bytes.Compare(mgr.pc.publicEd[:], pub[:]) < 0 {
 			// ours goes on; sealed to a key of the peer older than the one its init came with, it would not open
 			// there, and the peer, waiting for our ack, would not answer it: again, to that key. One of ours sent
-			// once in reply to a packet no one signed, maybe lost and not sent again, gives way to the peer's
+			// once in reply to a packet no one signed goes on too: the peer gives way to it, and had ours given way
+			// as well, each end would answer the other and the ratchets part for seconds (R6A-4). It may have been
+			// lost (N-R4-1): it goes again now, the same bytes, at most once in half pqInitRetry, and stays once (the
+			// peer's own retries bring it again; a replayed init of the peer's gets as many bytes as it is)
+			if p.once {
+				if k := mgr.pc.pq.usableKey(pub); k != nil && k != p.key {
+					mgr._resealPending(pub, p)
+				} else if now := mgr.pc.pq.now(); now.Sub(p.resentAt) >= pqInitRetry/2 {
+					p.resentAt = now
+					mgr.pc.writeRaw(p.data, pub)
+				}
+				return
+			}
 			mgr._resealPending(pub, p)
 			return
 		}

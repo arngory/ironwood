@@ -255,19 +255,33 @@ func (mgr *sessionManager) _maybeStartPQ(pub *edPub) {
 }
 
 // _awaitPQInit: the peer, with the lower key and its ML-KEM key known here, is to start the PQ init that replaces the
-// classic session. None in pendingTimeout: our PQInfos do not reach it (dropped on the way?), and nothing else would
-// tell; a line in the log.
+// classic session. None in awaitStart (a few init retries): this end sends its own. The peer may be in answer only,
+// which never starts one (PQConfig.AnswerOnly: a node that leaves the start to its clients), or our PQInfos do not
+// reach it; crossing inits are settled as ever (the lower key's goes on). Where this end cannot start one (no room,
+// or the peer's key no longer usable), a line in the log once pendingTimeout passed, as before.
 func (mgr *sessionManager) _awaitPQInit(pub edPub) {
 	if mgr.pqAwait[pub] {
 		return
 	}
 	mgr.pqAwait[pub] = true
-	time.AfterFunc(mgr.pc.pq.pendingTimeout, func() {
+	time.AfterFunc(mgr.pc.pq.awaitStart, func() {
 		mgr.Act(nil, func() {
 			delete(mgr.pqAwait, pub)
-			if info := mgr.sessions[pub]; info != nil && !info.pq && mgr.pqPending[pub] == nil {
-				mgr.pc.pq.logStripped(&pub, "no PQ init of it came to our PQInfo", "the session stays classic")
+			info := mgr.sessions[pub]
+			if info == nil || info.pq || mgr.pqPending[pub] != nil || !mgr.pc.pq.initiates(&pub) {
+				return
 			}
+			if key := mgr.pc.pq.usableKey(&pub); key != nil && !mgr._pqStartFull(&pub) {
+				mgr._startPQ(&pub, key, false)
+				return
+			}
+			time.AfterFunc(mgr.pc.pq.pendingTimeout, func() {
+				mgr.Act(nil, func() {
+					if info := mgr.sessions[pub]; info != nil && !info.pq && mgr.pqPending[pub] == nil {
+						mgr.pc.pq.logStripped(&pub, "no PQ init of it came to our PQInfo", "the session stays classic")
+					}
+				})
+			})
 		})
 	})
 }

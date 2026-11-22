@@ -71,6 +71,7 @@ var (
 	pqInfoAnswerEvery = 30 * time.Second // our PQInfo in answer to a PQInfo, at most once per key (P-2)
 	initReplyInterval = 3 * time.Second  // an init in reply to traffic, at most once in this per key
 	pqInitRetry       = 2 * time.Second
+	pqAwaitStart      = 3 * pqInitRetry // the higher key's wait for the lower's PQ init before it sends its own
 	pqRollbackTries   = 3
 	pqRollbackAfter   = 30 * time.Second
 	pqStaleGrace      = 3 * time.Second
@@ -122,9 +123,10 @@ type pqState struct {
 	stickyLRU list.List
 	// the last line in the log of each kind that may come from many keys: one a pqLogInterval
 	stickyLogged, askedLogged, fullLogged, hardLogged, refusedLogged, unconfirmedLogged, noPQLogged, timeLogged time.Time
-	// pqStickyMax, pqPendingTimeout, pqUpgradeRetry and pqPeersMax, a test's own
+	// pqStickyMax, pqPendingTimeout, pqUpgradeRetry, pqPeersMax and pqAwaitStart, a test's own
 	stickyMax      int
 	pendingTimeout time.Duration
+	awaitStart     time.Duration
 	upgradeRetry   time.Duration
 	peersMax       int
 }
@@ -172,6 +174,7 @@ func (s *pqState) init() {
 	s.sticky = make(map[edPub]*list.Element)
 	s.unknownBucket.tokens, s.knownBucket.tokens, s.signedBucket.tokens = pqUnsolicitedRate, pqUnsolicitedRate, pqUnsolicitedRate
 	s.stickyMax, s.pendingTimeout, s.upgradeRetry, s.peersMax = pqStickyMax, pqPendingTimeout, pqUpgradeRetry, pqPeersMax
+	s.awaitStart = pqAwaitStart
 }
 
 func (s *pqState) config() *PQConfig {

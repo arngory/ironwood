@@ -1088,23 +1088,27 @@ func TestPQNoClassicInitToSticky(t *testing.T) {
 }
 
 // A PQInfo of the higher key lost on the way at first contact: the lower one never learns its ML-KEM key and starts
-// no PQ init; the higher one, which knows the lower's, says so in its log.
+// no PQ init. Before round 8 the higher one, which knows the lower's, only said so in its log and the session stayed
+// classic; now it sends its own once awaitStart passed, and the session is PQ.
 func TestPQInfoStrippedLogged(t *testing.T) {
 	t.Parallel()
-	var logH logSink
 	x, y := newPQNode(t, pqOn), newPQNode(t, pqOn)
 	lo, hi := lowerFirst(x, y)
-	hi.pc.SetPQ(PQConfig{Enabled: true, Logf: logH.f})
-	hi.pc.pq.pendingTimeout = time.Second
+	hi.pc.pq.awaitStart = time.Second
 	hi.dropType[sessionTypePQInfo].Store(true)
 	linkPQ(t, lo, hi)
 	if !hears(lo, hi, "hello", 3*time.Second) {
 		t.Fatal("no session")
 	}
-	for deadline := time.Now().Add(4 * time.Second); logH.count("no PQ init of it came to our PQInfo") == 0; time.Sleep(100 * time.Millisecond) {
+	for deadline := time.Now().Add(8 * time.Second); session(lo, hi) != "pq" || session(hi, lo) != "pq"; {
 		if time.Now().After(deadline) {
-			t.Fatalf("no line in the higher key's log: %q (sessions %s, %s)", logH.all(), session(lo, hi), session(hi, lo))
+			t.Fatalf("sessions %s, %s: want pq (PQ inits of the higher key %d)", session(lo, hi), session(hi, lo), hi.sent[sessionTypePQInit].Load())
 		}
+		hears(lo, hi, "ping", 200*time.Millisecond)
+		hears(hi, lo, "pong", 200*time.Millisecond)
+	}
+	if n := lo.sent[sessionTypePQInit].Load(); n != 0 {
+		t.Errorf("the lower key, which never learnt the higher's ML-KEM key, sent %d PQ inits", n)
 	}
 }
 

@@ -316,7 +316,8 @@ type pqAskState struct {
 // _askPQInfoAgain: a classic session up, PQ wanted, and the peer's ML-KEM key not known here: our PQInfo goes again
 // after pqInfoInterval, then twice and four times that, pqAskTries in all, until its key comes (its PQInfo answers
 // ours) or a PQ session is up. All unanswered, the peer most likely has no PQ: it is asked no more until its next
-// handshake (round 9; before, a round again every upgradeRetry, some 5 KB in 5 minutes to each such peer). The peer's
+// handshake (round 9; before, a round again every upgradeRetry, some 5 KB in 5 minutes to each such peer). The price:
+// a peer with PQ that lost all three answers stays classic until that handshake, not for upgradeRetry. The peer's
 // answer may be lost:
 // while a node finds the path to us one packet is held for us, and its PQInfo can give way to the packet of the
 // classic session that went with it. Before round 8b nothing asked again, and a peer in answer only, which starts

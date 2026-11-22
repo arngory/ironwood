@@ -75,6 +75,7 @@ func (mgr *sessionManager) _put(ed edPub, info *sessionInfo) {
 	}
 	if info == nil {
 		delete(mgr.sessions, ed)
+		delete(mgr.pqAsk, ed) // its asks of a classic session gone with it (round 8d)
 		return
 	}
 	mgr.sessions[ed] = info
@@ -354,7 +355,7 @@ func (mgr *sessionManager) _handleTraffic(pub *edPub, msg []byte) {
 			// to the classic session beside a PQ one nothing opened under yet: the peer may not have the PQ one
 			info.fallback.doRecv(mgr, msg)
 			return
-		case info.pq && info.fallback != nil && mgr._fallbackGrace(info):
+		case info.pq && info.fallback != nil && mgr._fallbackGrace(info) && !mgr.pc.pq.requiredByConfig(pub):
 			// the PQ session confirmed here a moment ago, and the peer sends by the classic one still: it has not
 			// opened a PQ packet of ours yet (a few ms behind, or ours held on the way). Taken for pqStaleGrace, or a
 			// window of its data in flight is lost at the switch, and TCP over it stalls on its backoff (round 8c).

@@ -219,6 +219,16 @@ func (s *pqState) required(key *edPub) bool {
 	return cfg.Required(k[:])
 }
 
+// requiredByConfig: PQConfig.Required says a session with key must be PQ (a hold of its own aside)
+func (s *pqState) requiredByConfig(key *edPub) bool {
+	cfg := s.config()
+	if cfg == nil || cfg.Required == nil {
+		return false
+	}
+	k := *key
+	return cfg.Required(k[:])
+}
+
 // isSticky: key is held to PQ sessions (it had one here), its hold not past
 func (s *pqState) isSticky(key *edPub) bool {
 	s.mu.Lock()
@@ -687,14 +697,14 @@ func (s *pqState) takeRollback(ed *edPub) *pqPeerKey {
 	return k
 }
 
-// answerDue: a PQInfo of ed's may be answered with ours (at most once in pqInfoAnswerEvery, pqInfoAnswerBurst times
-// in answer only); counts it. With a one-way delay of half pqInfoInterval or more, each end's answer would come after
-// the other's limit ran out, and the two would answer each other for good (P-2). In answer only more than one: such a
+// answerRoom: a PQInfo of ed's may be answered with ours (at most once in pqInfoAnswerEvery, pqInfoAnswerBurst times
+// in answer only); answerSpent counts an answer that went (round 8d: no slot spent on one infoDue held back). With a
+// one-way delay of half pqInfoInterval or more, each end's answer would come after the other's limit ran out, and the two would answer each other for good (P-2). In answer only more than one: such a
 // node starts nothing itself, and a peer that lost its first answer (one packet held on the way while a path is
 // found) asks again (round 8b); with one answer in 30 s the session stayed classic. A peer with PQ on still answers
 // once in 30 s, so a ping-pong with it stays as bounded as before, and two nodes in answer only, which ask nothing of
 // each other, answer at most a burst each in 30 s.
-func (s *pqState) answerDue(ed *edPub) bool {
+func (s *pqState) answerRoom(ed *edPub) bool {
 	burst := 1
 	if s.answerOnly() {
 		burst = pqInfoAnswerBurst
@@ -705,10 +715,26 @@ func (s *pqState) answerDue(ed *edPub) bool {
 	if l.answeredAt.IsZero() || now.Sub(l.answeredAt) >= pqInfoAnswerEvery {
 		l.answeredAt, l.answered = now, 0
 	}
-	if l.answered >= burst {
-		return false
+	return l.answered < burst
+}
+
+// answerSpent: an answer of ours to a PQInfo of ed's went (answerRoom)
+func (s *pqState) answerSpent(ed *edPub) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	l, now := s._limit(ed), s.now()
+	if l.answeredAt.IsZero() || now.Sub(l.answeredAt) >= pqInfoAnswerEvery {
+		l.answeredAt, l.answered = now, 0
 	}
 	l.answered++
+}
+
+// answerDue: answerRoom and answerSpent at once (tests)
+func (s *pqState) answerDue(ed *edPub) bool {
+	if !s.answerRoom(ed) {
+		return false
+	}
+	s.answerSpent(ed)
 	return true
 }
 

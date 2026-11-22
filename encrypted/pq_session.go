@@ -179,8 +179,12 @@ func (mgr *sessionManager) _handlePQInfo(pub *edPub, data []byte) {
 	accepted, _ := mgr.pc.pq.accept(pub, &pq.pub, pq.seq, pq.notAfter)
 	// an answer, so that the sender knows our key too (it may have lost it): limited, or two nodes would ping-pong
 	// (pqInfoInterval, and pqInfoAnswerEvery for these answers: a slow path ping-pongs past the first, P-2)
-	if mgr.pc.pq.answerDue(pub) {
-		mgr._sendPQInfoDue(pub, askSigned)
+	if mgr.pc.pq.answerRoom(pub) {
+		// the burst's slot spent on an answer that went, not on one infoDue held back (round 8d)
+		if due, _ := mgr.pc.pq.infoDue(pub, askSigned); due {
+			mgr.pc.pq.answerSpent(pub)
+			mgr.sendPQInfo(pub)
+		}
 	}
 	if !accepted {
 		return
@@ -272,7 +276,17 @@ func (mgr *sessionManager) _awaitPQInit(pub edPub) {
 		mgr.Act(nil, func() {
 			delete(mgr.pqAwait, pub)
 			info := mgr.sessions[pub]
-			if info == nil || info.pq || mgr.pqPending[pub] != nil || !mgr.pc.pq.initiates(&pub) {
+			if info == nil || info.pq || !mgr.pc.pq.initiates(&pub) {
+				return
+			}
+			if p := mgr.pqPending[pub]; p != nil {
+				if p.once {
+					// a once-init (sent in reply to a packet no one signed) stands where ours would: it is not sent
+					// again and its expiry schedules nothing, so one lost would leave the session classic. Sent
+					// again until its ack, as _maybeStartPQ does for one (R6A-2; round 8d)
+					p.once = false
+					mgr._sendPending(&pub, p)
+				}
 				return
 			}
 			if key := mgr.pc.pq.usableKey(&pub); key != nil && !mgr._pqStartFull(&pub) {
@@ -329,6 +343,11 @@ func (mgr *sessionManager) _askPQInfoAgain(pub edPub) {
 				return
 			}
 			mgr._maybeStartPQ(&pub) // our PQInfo again (its interval passed), and the next ask
+			if !a.waiting && mgr.pqAsk[pub] == a {
+				// _maybeStartPQ asked nothing again (no token for our PQInfo, no room, PQ off or in answer only
+				// now): the entry goes, or it would stay for good (round 8d)
+				delete(mgr.pqAsk, pub)
+			}
 		})
 	})
 }

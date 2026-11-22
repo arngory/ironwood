@@ -258,7 +258,9 @@ func (mgr *sessionManager) _maybeStartPQ(pub *edPub) {
 // classic session. None in awaitStart (a few init retries): this end sends its own. The peer may be in answer only,
 // which never starts one (PQConfig.AnswerOnly: a node that leaves the start to its clients), or our PQInfos do not
 // reach it; crossing inits are settled as ever (the lower key's goes on). Where this end cannot start one (no room,
-// or the peer's key no longer usable), a line in the log once pendingTimeout passed, as before.
+// or the peer's key no longer usable), the upgrade is tried again after upgradeRetry, and a line in the log once
+// pendingTimeout passed with the session still classic. Before round 8 this end only waited, and an answer-only
+// peer with the lower key left the session classic for good.
 func (mgr *sessionManager) _awaitPQInit(pub edPub) {
 	if mgr.pqAwait[pub] {
 		return
@@ -275,6 +277,8 @@ func (mgr *sessionManager) _awaitPQInit(pub edPub) {
 				mgr._startPQ(&pub, key, false)
 				return
 			}
+			// no room, or the peer's key no longer usable: tried again later, not dropped
+			mgr._upgradeLater(pub)
 			time.AfterFunc(mgr.pc.pq.pendingTimeout, func() {
 				mgr.Act(nil, func() {
 					if info := mgr.sessions[pub]; info != nil && !info.pq && mgr.pqPending[pub] == nil {

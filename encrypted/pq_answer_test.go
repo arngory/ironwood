@@ -19,17 +19,22 @@ func answerSetup(t *testing.T) (a, b *pqNode) {
 	return
 }
 
-// Answer only, a new peer: a starts nothing of PQ itself. With the lower key it is the one an upgrade waits for, so
-// the session stays classic: no PQ init of a's, whatever b's PQInfo says.
+// Answer only, a new peer: a starts nothing of PQ itself. With the lower key it is the one an upgrade waits for: b,
+// with PQ on, waits awaitStart for it and then sends its own init (round 8), and the session is PQ. Before, it stayed
+// classic for good.
 func TestPQAnswerOnlyStartsNothing(t *testing.T) {
 	t.Parallel()
 	a, b := answerSetup(t)
-	time.Sleep(3 * time.Second)
+	time.Sleep(time.Second)
 	if s := session(a, b); s != "classic" {
-		t.Errorf("a's session %s, want classic", s)
+		t.Errorf("a's session %s within awaitStart, want classic", s)
 	}
+	waitSessions(t, a, b, "pq", pqAwaitStart+10*time.Second)
 	if n := a.sent[sessionTypePQInit].Load(); n != 0 {
 		t.Errorf("a sent %d PQ inits in answer only", n)
+	}
+	if n := b.sent[sessionTypePQInit].Load(); n == 0 {
+		t.Error("the session is PQ, and b sent no PQ init")
 	}
 }
 

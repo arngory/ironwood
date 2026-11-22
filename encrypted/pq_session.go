@@ -179,8 +179,12 @@ func (mgr *sessionManager) _handlePQInfo(pub *edPub, data []byte) {
 	accepted, _ := mgr.pc.pq.accept(pub, &pq.pub, pq.seq, pq.notAfter)
 	// an answer, so that the sender knows our key too (it may have lost it): limited, or two nodes would ping-pong
 	// (pqInfoInterval, and pqInfoAnswerEvery for these answers: a slow path ping-pongs past the first, P-2)
-	if mgr.pc.pq.answerDue(pub) {
-		mgr._sendPQInfoDue(pub, askSigned)
+	if mgr.pc.pq.answerRoom(pub) {
+		// the burst's slot spent on an answer that went, not on one infoDue held back (round 8d)
+		if due, _ := mgr.pc.pq.infoDue(pub, askSigned); due {
+			mgr.pc.pq.answerSpent(pub)
+			mgr.sendPQInfo(pub)
+		}
 	}
 	if !accepted {
 		return
@@ -245,6 +249,8 @@ func (mgr *sessionManager) _maybeStartPQ(pub *edPub) {
 		}
 		if mgr._sendPQInfoDue(pub, ask) && info != nil {
 			mgr._upgradeLater(*pub) // no token for our PQInfo now: the upgrade tried again later, not dropped
+		} else if key == nil && info != nil {
+			mgr._askPQInfoAgain(*pub) // its answer may be lost: asked again, a few times (round 8b)
 		}
 		if key != nil && info != nil {
 			mgr._awaitPQInit(*pub)
@@ -255,18 +261,92 @@ func (mgr *sessionManager) _maybeStartPQ(pub *edPub) {
 }
 
 // _awaitPQInit: the peer, with the lower key and its ML-KEM key known here, is to start the PQ init that replaces the
-// classic session. None in pendingTimeout: our PQInfos do not reach it (dropped on the way?), and nothing else would
-// tell; a line in the log.
+// classic session. None in awaitStart (a few init retries): this end sends its own. The peer may be in answer only,
+// which never starts one (PQConfig.AnswerOnly: a node that leaves the start to its clients), or our PQInfos do not
+// reach it; crossing inits are settled as ever (the lower key's goes on). Where this end cannot start one (no room,
+// or the peer's key no longer usable), the upgrade is tried again after upgradeRetry, and a line in the log once
+// pendingTimeout passed with the session still classic. Before round 8 this end only waited, and an answer-only
+// peer with the lower key left the session classic for good.
 func (mgr *sessionManager) _awaitPQInit(pub edPub) {
 	if mgr.pqAwait[pub] {
 		return
 	}
 	mgr.pqAwait[pub] = true
-	time.AfterFunc(mgr.pc.pq.pendingTimeout, func() {
+	time.AfterFunc(mgr.pc.pq.awaitStart, func() {
 		mgr.Act(nil, func() {
 			delete(mgr.pqAwait, pub)
-			if info := mgr.sessions[pub]; info != nil && !info.pq && mgr.pqPending[pub] == nil {
-				mgr.pc.pq.logStripped(&pub, "no PQ init of it came to our PQInfo", "the session stays classic")
+			info := mgr.sessions[pub]
+			if info == nil || info.pq || !mgr.pc.pq.initiates(&pub) {
+				return
+			}
+			if p := mgr.pqPending[pub]; p != nil {
+				if p.once {
+					// a once-init (sent in reply to a packet no one signed) stands where ours would: it is not sent
+					// again and its expiry schedules nothing, so one lost would leave the session classic. Sent
+					// again until its ack, as _maybeStartPQ does for one (R6A-2; round 8d)
+					p.once = false
+					mgr._sendPending(&pub, p)
+				}
+				return
+			}
+			if key := mgr.pc.pq.usableKey(&pub); key != nil && !mgr._pqStartFull(&pub) {
+				mgr._startPQ(&pub, key, false)
+				return
+			}
+			// no room, or the peer's key no longer usable: tried again later, not dropped
+			mgr._upgradeLater(pub)
+			time.AfterFunc(mgr.pc.pq.pendingTimeout, func() {
+				mgr.Act(nil, func() {
+					if info := mgr.sessions[pub]; info != nil && !info.pq && mgr.pqPending[pub] == nil {
+						mgr.pc.pq.logStripped(&pub, "no PQ init of it came to our PQInfo", "the session stays classic")
+					}
+				})
+			})
+		})
+	})
+}
+
+// pqAskState: our PQInfos again to a peer with a classic session whose ML-KEM key we lack (_askPQInfoAgain)
+type pqAskState struct {
+	tries   int  // sent again so far
+	waiting bool // one is due
+}
+
+// _askPQInfoAgain: a classic session up, PQ wanted, and the peer's ML-KEM key not known here: our PQInfo goes again
+// after pqInfoInterval, then twice and four times that, pqAskTries in all, until its key comes (its PQInfo answers
+// ours) or a PQ session is up; then the upgrade is tried again after upgradeRetry. The peer's answer may be lost:
+// while a node finds the path to us one packet is held for us, and its PQInfo can give way to the packet of the
+// classic session that went with it. Before round 8b nothing asked again, and a peer in answer only, which starts
+// nothing, left the session classic.
+func (mgr *sessionManager) _askPQInfoAgain(pub edPub) {
+	a := mgr.pqAsk[pub]
+	if a == nil {
+		a = &pqAskState{}
+		mgr.pqAsk[pub] = a
+	}
+	if a.waiting {
+		return
+	}
+	if a.tries >= pqAskTries {
+		delete(mgr.pqAsk, pub)
+		mgr._upgradeLater(pub)
+		return
+	}
+	a.waiting = true
+	time.AfterFunc(pqInfoInterval<<a.tries, func() {
+		mgr.Act(nil, func() {
+			a.waiting = false
+			a.tries++
+			info := mgr.sessions[pub]
+			if info == nil || info.pq || mgr.pqPending[pub] != nil || mgr.pc.pq.usableKey(&pub) != nil {
+				delete(mgr.pqAsk, pub)
+				return
+			}
+			mgr._maybeStartPQ(&pub) // our PQInfo again (its interval passed), and the next ask
+			if !a.waiting && mgr.pqAsk[pub] == a {
+				// _maybeStartPQ asked nothing again (no token for our PQInfo, no room, PQ off or in answer only
+				// now): the entry goes, or it would stay for good (round 8d)
+				delete(mgr.pqAsk, pub)
 			}
 		})
 	})

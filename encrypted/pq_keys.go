@@ -68,9 +68,12 @@ var (
 	pqKeyValidity     = 48 * time.Hour // its notAfter: its number (the time it was made) and this
 	pqClockSlack      = 72 * time.Hour // a PQInfo is taken this long after its notAfter (clocks of phones are off)
 	pqInfoInterval    = 3 * time.Second
-	pqInfoAnswerEvery = 30 * time.Second // our PQInfo in answer to a PQInfo, at most once per key (P-2)
+	pqInfoAnswerEvery = 30 * time.Second // our PQInfo in answer to a PQInfo, at most once per key in this (P-2)
+	pqInfoAnswerBurst = 3                // in answer only, so many in pqInfoAnswerEvery: a lost answer holds no session classic (round 8b)
+	pqAskTries        = 3                // our PQInfo again, after pqInfoInterval, then twice and four times it (round 8b)
 	initReplyInterval = 3 * time.Second  // an init in reply to traffic, at most once in this per key
 	pqInitRetry       = 2 * time.Second
+	pqAwaitStart      = 3 * pqInitRetry // the higher key's wait for the lower's PQ init before it sends its own
 	pqRollbackTries   = 3
 	pqRollbackAfter   = 30 * time.Second
 	pqStaleGrace      = 3 * time.Second
@@ -122,9 +125,10 @@ type pqState struct {
 	stickyLRU list.List
 	// the last line in the log of each kind that may come from many keys: one a pqLogInterval
 	stickyLogged, askedLogged, fullLogged, hardLogged, refusedLogged, unconfirmedLogged, noPQLogged, timeLogged time.Time
-	// pqStickyMax, pqPendingTimeout, pqUpgradeRetry and pqPeersMax, a test's own
+	// pqStickyMax, pqPendingTimeout, pqUpgradeRetry, pqPeersMax and pqAwaitStart, a test's own
 	stickyMax      int
 	pendingTimeout time.Duration
+	awaitStart     time.Duration
 	upgradeRetry   time.Duration
 	peersMax       int
 }
@@ -162,7 +166,8 @@ type pqLimit struct {
 	ed          edPub
 	sentInfoAt  time.Time // our PQInfo to it, last
 	initReplyAt time.Time // our init in reply to its traffic, last
-	answeredAt  time.Time // our PQInfo in answer to a PQInfo of its, last
+	answeredAt  time.Time // the start of the window of our answers to its PQInfos (answerDue)
+	answered    int       // our answers in that window
 }
 
 func (s *pqState) init() {
@@ -172,6 +177,7 @@ func (s *pqState) init() {
 	s.sticky = make(map[edPub]*list.Element)
 	s.unknownBucket.tokens, s.knownBucket.tokens, s.signedBucket.tokens = pqUnsolicitedRate, pqUnsolicitedRate, pqUnsolicitedRate
 	s.stickyMax, s.pendingTimeout, s.upgradeRetry, s.peersMax = pqStickyMax, pqPendingTimeout, pqUpgradeRetry, pqPeersMax
+	s.awaitStart = pqAwaitStart
 }
 
 func (s *pqState) config() *PQConfig {
@@ -210,6 +216,16 @@ func (s *pqState) required(key *edPub) bool {
 		return false
 	}
 	k := *key // a copy the callback may keep: key itself stays where it is (no allocation on the way without one)
+	return cfg.Required(k[:])
+}
+
+// requiredByConfig: PQConfig.Required says a session with key must be PQ (a hold of its own aside)
+func (s *pqState) requiredByConfig(key *edPub) bool {
+	cfg := s.config()
+	if cfg == nil || cfg.Required == nil {
+		return false
+	}
+	k := *key
 	return cfg.Required(k[:])
 }
 
@@ -681,17 +697,44 @@ func (s *pqState) takeRollback(ed *edPub) *pqPeerKey {
 	return k
 }
 
-// answerDue: a PQInfo of ed's may be answered with ours (at most once in pqInfoAnswerEvery); counts it. With a
-// one-way delay of half pqInfoInterval or more, each end's answer would come after the other's limit ran out, and the
-// two would answer each other for good (P-2)
-func (s *pqState) answerDue(ed *edPub) bool {
+// answerRoom: a PQInfo of ed's may be answered with ours (at most once in pqInfoAnswerEvery, pqInfoAnswerBurst times
+// in answer only); answerSpent counts an answer that went (round 8d: no slot spent on one infoDue held back). With a
+// one-way delay of half pqInfoInterval or more, each end's answer would come after the other's limit ran out, and the two would answer each other for good (P-2). In answer only more than one: such a
+// node starts nothing itself, and a peer that lost its first answer (one packet held on the way while a path is
+// found) asks again (round 8b); with one answer in 30 s the session stayed classic. A peer with PQ on still answers
+// once in 30 s, so a ping-pong with it stays as bounded as before, and two nodes in answer only, which ask nothing of
+// each other, answer at most a burst each in 30 s.
+func (s *pqState) answerRoom(ed *edPub) bool {
+	burst := 1
+	if s.answerOnly() {
+		burst = pqInfoAnswerBurst
+	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	l, now := s._limit(ed), s.now()
-	if !l.answeredAt.IsZero() && now.Sub(l.answeredAt) < pqInfoAnswerEvery {
+	if l.answeredAt.IsZero() || now.Sub(l.answeredAt) >= pqInfoAnswerEvery {
+		l.answeredAt, l.answered = now, 0
+	}
+	return l.answered < burst
+}
+
+// answerSpent: an answer of ours to a PQInfo of ed's went (answerRoom)
+func (s *pqState) answerSpent(ed *edPub) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	l, now := s._limit(ed), s.now()
+	if l.answeredAt.IsZero() || now.Sub(l.answeredAt) >= pqInfoAnswerEvery {
+		l.answeredAt, l.answered = now, 0
+	}
+	l.answered++
+}
+
+// answerDue: answerRoom and answerSpent at once (tests)
+func (s *pqState) answerDue(ed *edPub) bool {
+	if !s.answerRoom(ed) {
 		return false
 	}
-	l.answeredAt = now
+	s.answerSpent(ed)
 	return true
 }
 

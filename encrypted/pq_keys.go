@@ -35,11 +35,12 @@ type PQConfig struct {
 	// Logf takes the warnings: a PQInfo refused by its time (with the difference of the clocks), a key with a lower
 	// number taken after a restart, a key held to PQ that asks for classic, a PQ session that did not come up. It is
 	// called from a goroutine of its own, after the event (it may call into the PacketConn); past 64 lines waiting,
-	// lines are dropped, and their number logged. Nil: none.
+	// lines are dropped, and their number logged. Lines of events before Close may still come shortly after it.
+	// Nil: none.
 	Logf func(format string, args ...any)
 	// SessionMax is the most PQ sessions up, with traffic opened under them or not, for this node to start a PQ one
 	// with a peer that may be classic: past it, a new peer gets a classic session (a line in the log). Each PQ session
-	// holds some 18 KB (a classic one 3). A peer that starts PQ with us still gets it, and so does a key held to PQ,
+	// holds some 12.4 KB (a classic one 3.1). A peer that starts PQ with us still gets it, and so does a key held to PQ,
 	// and our answer to PQ traffic, up to a hard limit of SessionMax and a quarter of it more (at least 64 more): the
 	// PQ sessions held at once, and their memory (one that goes is let go at once). At the hard limit a PQ session
 	// goes to make room: one nothing opened under yet first, then of the others the one nothing opened under for the
@@ -98,6 +99,8 @@ type pqState struct {
 	// the buckets for answers that cost more than what asked for them: to keys with no entry in peers (unknown), and
 	// to keys with one (a signed contact), apart, so that packets claimed from random keys cannot starve the others
 	unknownBucket, knownBucket pqBucket
+	// R5-3: signed asks of keys with no entry apart from both: no packet no one signed draws on it
+	signedBucket pqBucket
 	// Logf's lines waiting for its goroutine (logf)
 	logMu      sync.Mutex
 	logQ       []pqLogLine
@@ -132,7 +135,7 @@ type pqAsk int
 
 const (
 	askOwn      pqAsk = iota // our own traffic waits for a session: no token
-	askSigned                // a signed packet of the key's: a token of the known bucket, the key in peers or not
+	askSigned                // a signed packet of the key's: the known bucket's token for a key in peers, the signed bucket's else
 	askUnsigned              // a packet no one signed, claimed from the key: a token of the bucket its entry says
 )
 
@@ -155,7 +158,7 @@ func (s *pqState) init() {
 	s.peers = make(map[edPub]*list.Element)
 	s.limits = make(map[edPub]*list.Element)
 	s.sticky = make(map[edPub]*list.Element)
-	s.unknownBucket.tokens, s.knownBucket.tokens = pqUnsolicitedRate, pqUnsolicitedRate
+	s.unknownBucket.tokens, s.knownBucket.tokens, s.signedBucket.tokens = pqUnsolicitedRate, pqUnsolicitedRate, pqUnsolicitedRate
 	s.stickyMax, s.pendingTimeout, s.upgradeRetry, s.peersMax = pqStickyMax, pqPendingTimeout, pqUpgradeRetry, pqPeersMax
 }
 
@@ -667,8 +670,12 @@ func (s *pqState) infoDue(ed *edPub, ask pqAsk) (due, starved bool) {
 		if !s.unknownBucket.take(now) {
 			return false, true
 		}
-	case ask == askUnsigned || (ask == askSigned && !known):
+	case ask == askUnsigned:
 		if !s.knownBucket.take(now) {
+			return false, true
+		}
+	case ask == askSigned && !known:
+		if !s.signedBucket.take(now) {
 			return false, true
 		}
 	}

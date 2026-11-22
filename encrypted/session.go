@@ -67,6 +67,9 @@ func (mgr *sessionManager) init(pc *PacketConn) {
 func (mgr *sessionManager) _put(ed edPub, info *sessionInfo) {
 	if old := mgr.sessions[ed]; old != nil && old.pq {
 		mgr.pqCount.Add(-1)
+		if mgr.pqUnconfirmed[ed] == old {
+			delete(mgr.pqUnconfirmed, ed) // whichever way it goes (_expire, _evict, replaced): not counted on (N-R5-3)
+		}
 	}
 	if info == nil {
 		delete(mgr.sessions, ed)
@@ -84,25 +87,19 @@ func (mgr *sessionManager) _restoreClassic(info *sessionInfo) {
 	fb := info.fallback
 	info.fallback = nil
 	mgr._put(info.ed, fb)
-	if mgr.pqUnconfirmed[info.ed] == info {
-		delete(mgr.pqUnconfirmed, info.ed)
-	}
 	fb.Act(mgr, fb._resetTimer)
 }
 
 // _evict: the PQ session info goes, to make room: the classic one beside it takes its place where there is one (and
 // the upgrade is tried again later); then: which, for the log
 func (mgr *sessionManager) _evict(info *sessionInfo) (then string) {
-	// its timer stopped: else it would hold the session (some 18 KB) for idleTimeout, and the hard limit would not
+	// its timer stopped: else it would hold the session (some 12.4 KB) for idleTimeout, and the hard limit would not
 	// bound the memory of a churn of new ones
 	defer info.Act(mgr, func() {
 		if info.timer != nil {
 			info.timer.Stop()
 		}
 	})
-	if mgr.pqUnconfirmed[info.ed] == info {
-		delete(mgr.pqUnconfirmed, info.ed)
-	}
 	// beside a confirmed one, the classic session is stale (the peer left it), as for dropPQ and _expire
 	if info.fallback != nil && !info.confirmed.Load() && !mgr.pc.pq.required(&info.ed) {
 		mgr._restoreClassic(info)
@@ -532,6 +529,7 @@ type sessionInfo struct {
 	stickyAt     time.Time    // the key marked sticky by traffic of this session, last (pq.now)
 	sentAt       time.Time    // a PQ packet of ours sent under it, last
 	initCurrent  boxPub       // the peer's current key in the last init or ack taken
+	seqCurrents  []boxPub     // R5-2: the peer's current keys of each init or ack taken at seq
 	confirmed    atomic.Bool  // a PQ packet opened (read by the manager)
 	openedAt     atomic.Int64 // then, last (pq.now, Unix nanoseconds; read by the manager)
 	adBuf        [32]byte     // a PQ packet's header as associated data (Seal: not where the output goes)
@@ -619,7 +617,7 @@ func (info *sessionInfo) handleInit(from phony.Actor, init *sessionInit, pqi *pq
 		// A PQ init of the same second as the last one taken, with other keys, is a new one of the peer's (it lost
 		// the session and began anew within the second: the seq is in whole seconds), not a repeat: taken. One the
 		// same (a repeat, or replayed) is not; no one else can sign one. Classic as upstream
-		if init.seq == info.seq && (pqi == nil || init.current == info.initCurrent) {
+		if init.seq == info.seq && (pqi == nil || info._seenAtSeq(&init.current)) {
 			// The same init again: its sender has not had our ack, which may have gone out before we had a path back
 			// (and the lookup for one was lost), or got lost on the way. Ignored, the contact would wait for this
 			// session to time out. While nothing came from the sender over the session, the very ack of the first
@@ -650,7 +648,7 @@ func (info *sessionInfo) handleAck(from phony.Actor, ack *sessionAck, pqi *pqIni
 	info.Act(from, func() {
 		// a PQ ack of the same second as the last init or ack taken, with other keys, is new, as for an init
 		// (handleInit): the peer took an init of ours of that second, and its keys moved on
-		if ack.seq < info.seq || (ack.seq == info.seq && (pqi == nil || ack.current == info.initCurrent)) {
+		if ack.seq < info.seq || (ack.seq == info.seq && (pqi == nil || info._seenAtSeq(&ack.current))) {
 			return
 		}
 		info._handleUpdate(&ack.sessionInit, pqi, false)
@@ -669,6 +667,10 @@ func (info *sessionInfo) _handleUpdate(init *sessionInit, pqi *pqInit, answering
 	info.current = init.current
 	info.next = init.next
 	info.initCurrent = init.current
+	if init.seq != info.seq {
+		info.seqCurrents = info.seqCurrents[:0]
+	}
+	info.seqCurrents = append(info.seqCurrents, init.current)
 	info.seq = init.seq
 	info.remoteKeySeq = init.keySeq
 	// Advance our keys, since this counts as a response
@@ -681,6 +683,20 @@ func (info *sessionInfo) _handleUpdate(init *sessionInit, pqi *pqInit, answering
 	info._fixShared(0, info.sendNonce)
 	info._carryReplay(&old)
 	info._resetTimer()
+}
+
+// _seenAtSeq: an init or ack with current c was taken at info.seq already (R5-2: a replay, not new); past 8 of
+// them, any is taken for one
+func (info *sessionInfo) _seenAtSeq(c *boxPub) bool {
+	if len(info.seqCurrents) >= 8 {
+		return true
+	}
+	for i := range info.seqCurrents {
+		if info.seqCurrents[i] == *c {
+			return true
+		}
+	}
+	return false
 }
 
 // sessionReplay: a session's receive keys and the replay state of each

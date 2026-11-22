@@ -42,7 +42,10 @@ func heapNow() uint64 {
 // fill: n's PQ sessions up to count, from light peers' PQ inits (their keys)
 func fill(t *testing.T, n *pqNode, count int) (keys []edPub) {
 	t.Helper()
-	for n.pc.PQSessionCount() < count {
+	for i := 0; n.pc.PQSessionCount() < count; i++ {
+		if i >= 4*count {
+			t.Fatalf("fill: %d PQ sessions after %d inits, %d wanted", n.pc.PQSessionCount(), i, count)
+		}
 		p := lightPC(t)
 		k := edOf(p)
 		deliverTo(n, k, pqInitFrom(t, p, n.pc))
@@ -476,7 +479,7 @@ func dropFirstProbe() *func([]byte) bool {
 // comes before the writer's session would go. No handshake, nothing lost.
 func TestPQKeepaliveLost(t *testing.T) {
 	t.Parallel()
-	a, b := r4OneWay(t, true, time.Second)
+	a, b := r4OneWay(t, true, 2*time.Second) // 2 s: the sleep and the setup well inside idleTimeout
 	time.Sleep(600 * time.Millisecond)
 	b.tap.Store(dropFirstProbe())
 	bKey := b.key()
@@ -492,7 +495,7 @@ func TestPQKeepaliveLost(t *testing.T) {
 // The same with a dense flow (a packet a millisecond).
 func TestPQKeepaliveLostDense(t *testing.T) {
 	t.Parallel()
-	a, b := r4OneWay(t, true, time.Second)
+	a, b := r4OneWay(t, true, 2*time.Second) // 2 s: the sleep and the setup well inside idleTimeout
 	time.Sleep(600 * time.Millisecond)
 	b.tap.Store(dropFirstProbe())
 	for len(b.heard) > 0 {
@@ -512,7 +515,7 @@ func TestPQKeepaliveLostDense(t *testing.T) {
 // R4-4 (Q35, Q37): the keepalive of a one-way PQ flow goes about four times an idleTimeout, not once a packet.
 func TestPQKeepaliveRate(t *testing.T) {
 	t.Parallel()
-	a, b := r4OneWay(t, true, time.Second)
+	a, b := r4OneWay(t, true, 2*time.Second) // 2 s: the sleep and the setup well inside idleTimeout
 	time.Sleep(600 * time.Millisecond)
 	var sent atomic.Int64
 	tap := func(d []byte) bool {
@@ -679,7 +682,7 @@ func TestPQFloodKeepsNewContacts(t *testing.T) {
 func TestPQStarvedUpgradeLater(t *testing.T) {
 	n := newPQNode(t, pqOn) // no link
 	n.pc.pq.mu.Lock()
-	n.pc.pq.knownBucket = pqBucket{at: time.Now().Add(time.Hour)} // empty, for the next hour
+	n.pc.pq.signedBucket = pqBucket{at: time.Now().Add(time.Hour)} // empty, for the next hour
 	n.pc.pq.mu.Unlock()
 	p := lightPC(t)
 	k := edOf(p)

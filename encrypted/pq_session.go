@@ -282,18 +282,23 @@ func (mgr *sessionManager) _pqRoom(pub *edPub) bool {
 	if int(mgr.pqCount.Load()) < most {
 		return true
 	}
+	now := mgr.pc.pq.now().UnixNano()
 	var victim *sessionInfo
 	var victimRank [3]int64 // confirmed, held to PQ, the last packet opened (or the start): the least goes
 	for k, info := range mgr.sessions {
 		if !info.pq {
 			continue
 		}
+		confirmed := info.confirmed.Load()
+		if at := info.openedAt.Load(); confirmed && at != 0 && now-at < int64(mgr.evictIdle) {
+			continue // in use, held or not (idleTimeout >= evictIdle): no Required call (R5 scan)
+		}
 		held := mgr.pc.pq.required(&k)
 		rank := [3]int64{0, 0, info.since.UnixNano()}
 		if held {
 			rank[1] = 1
 		}
-		if info.confirmed.Load() {
+		if confirmed {
 			floor := mgr.evictIdle
 			if held {
 				floor = mgr.idleTimeout
@@ -397,7 +402,7 @@ func (mgr *sessionManager) _sendPending(pub *edPub, p *pqPending) {
 			if p.once || now.Sub(p.init.time()) >= mgr.pc.pq.pendingTimeout {
 				delete(mgr.pqPending, dest)
 				if p.once {
-					return // in reply to a packet no one signed: no line, and no upgrade of ours later for it
+					return // in reply to a packet no one signed: no line, and no upgrade of ours later for it (R3-4)
 				}
 				if info := mgr.sessions[dest]; info != nil && !info.pq {
 					// the peer announced its ML-KEM key, and nothing came back to ours: PQ packets lost on the way, or
@@ -638,7 +643,7 @@ func (mgr *sessionManager) _upgradeLater(pub edPub) {
 	})
 }
 
-// _countUnconfirmed keeps the PQ sessions no traffic opened under yet within pqUnconfirmedMax: each weighs some 18 KB
+// _countUnconfirmed keeps the PQ sessions no traffic opened under yet within pqUnconfirmedMax: each weighs some 12.4 KB
 // (a classic one 2.4), and anyone with a key of its own makes one with a PQ init. Past the limit, those confirmed
 // or gone since leave the count, then the oldest of the rest is dropped.
 func (mgr *sessionManager) _countUnconfirmed(info *sessionInfo) {

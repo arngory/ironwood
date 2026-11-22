@@ -31,7 +31,8 @@ type PQConfig struct {
 	// is still announced in reply to the peer's PQ packets, so that a peer holding this node to PQ keeps its session.
 	// A key held to PQ here (Required, or sticky) is the exception: with it the node starts PQ as with PQ on, or there
 	// would be no session at all. A way back from PQ without a break: the peers held to it stay PQ, the others classic.
-	// Ignored while Enabled is false.
+	// No key is held to PQ anew in answer only, nor is a hold moved on: the holds there run out (pqKeyValidity at
+	// most), and a peer that starts PQ with this node is not started with by it after. Ignored while Enabled is false.
 	AnswerOnly bool
 	// Required reports the keys a session with must be PQ: classic init, ack and traffic from them are dropped,
 	// and none goes to them. Others are "where possible": classic at once, PQ in its place once both ends know each
@@ -246,6 +247,9 @@ func (s *pqState) _holdUntil(notAfter uint64) uint64 {
 // least recently marked key with a handshake alone goes first (a full set would otherwise take no new key); each one
 // that goes is a key that can be downgraded again, so it is logged.
 func (s *pqState) markSticky(key *edPub, notAfter uint64, traffic bool) {
+	if s.answerOnly() {
+		return // answer only: no new hold, none moved on; the holds there run out (the owner's choice, 2026-11-22)
+	}
 	s.mu.Lock()
 	until := s._holdUntil(notAfter)
 	if k := s._held(key); k != nil {

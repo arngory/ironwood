@@ -132,3 +132,56 @@ func TestPQAnswerOnlyRequiredStarts(t *testing.T) {
 		t.Error("a sent no PQ init to a key held to PQ")
 	}
 }
+
+// Answer only holds no key anew (the owner's choice): a peer that starts PQ and writes is not held, and the node
+// starts nothing with it after; a hold made before stays as it was, not moved on, and runs out.
+func TestPQAnswerOnlyNoNewHold(t *testing.T) {
+	t.Parallel()
+	x, y := newPQNode(t, pqOn), newPQNode(t, pqOn)
+	starter, answerer := lowerFirst(x, y)
+	answerer.pc.SetPQ(pqAnswer)
+	linkPQ(t, starter, answerer)
+	if !hears(starter, answerer, "hello", 3*time.Second) || !hears(answerer, starter, "hello back", 3*time.Second) {
+		t.Fatal("no session")
+	}
+	waitSessions(t, starter, answerer, "pq", 10*time.Second)
+	keepWriting(starter, answerer, time.Second)
+	if sticky(answerer, starter) {
+		t.Errorf("answer only held the peer that started PQ")
+	}
+	if !sticky(starter, answerer) {
+		t.Errorf("the PQ-on starter does not hold the answering node")
+	}
+	sKey := starter.key()
+	if answerer.pc.pq.initiates(&sKey) {
+		t.Errorf("answer only starts PQ with a peer it does not hold")
+	}
+}
+
+// A hold made with PQ on is kept in answer only, but PQ traffic moves it on no more.
+func TestPQAnswerOnlyOldHoldNotMoved(t *testing.T) {
+	t.Parallel()
+	a, b := newPQNode(t, pqOn), newPQNode(t, pqOn)
+	linkPQ(t, a, b)
+	if !hears(a, b, "hello", 3*time.Second) || !hears(b, a, "hello back", 3*time.Second) {
+		t.Fatal("no session")
+	}
+	waitSessions(t, a, b, "pq", 10*time.Second)
+	keepWriting(a, b, time.Second)
+	bKey := b.key()
+	if stickyFor(a.pc, bKey) == nil {
+		t.Fatal("setup: a does not hold b")
+	}
+	clock := testClock(a.pc)
+	a.pc.SetPQ(pqAnswer)
+	before := stickyFor(a.pc, bKey).until
+	clock.Store(int64(time.Hour)) // an hour on: a hold moved on would move by it
+	keepWriting(a, b, time.Second)
+	k := stickyFor(a.pc, bKey)
+	if k == nil {
+		t.Fatal("the hold made before answer only went at once")
+	}
+	if k.until != before {
+		t.Errorf("answer only moved the old hold on by %d s", int64(k.until)-int64(before))
+	}
+}

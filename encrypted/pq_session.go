@@ -308,13 +308,17 @@ func (mgr *sessionManager) _awaitPQInit(pub edPub) {
 
 // pqAskState: our PQInfos again to a peer with a classic session whose ML-KEM key we lack (_askPQInfoAgain)
 type pqAskState struct {
-	tries   int  // sent again so far
-	waiting bool // one is due
+	tries     int  // sent again so far
+	waiting   bool // one is due
+	exhausted bool // pqAskTries went unanswered: asked no more until the peer's next handshake (round 9)
 }
 
 // _askPQInfoAgain: a classic session up, PQ wanted, and the peer's ML-KEM key not known here: our PQInfo goes again
 // after pqInfoInterval, then twice and four times that, pqAskTries in all, until its key comes (its PQInfo answers
-// ours) or a PQ session is up; then the upgrade is tried again after upgradeRetry. The peer's answer may be lost:
+// ours) or a PQ session is up. All unanswered, the peer most likely has no PQ: it is asked no more until its next
+// handshake (round 9; before, a round again every upgradeRetry, some 5 KB in 5 minutes to each such peer). The price:
+// a peer with PQ that lost all three answers stays classic until that handshake, not for upgradeRetry. The peer's
+// answer may be lost:
 // while a node finds the path to us one packet is held for us, and its PQInfo can give way to the packet of the
 // classic session that went with it. Before round 8b nothing asked again, and a peer in answer only, which starts
 // nothing, left the session classic.
@@ -324,12 +328,11 @@ func (mgr *sessionManager) _askPQInfoAgain(pub edPub) {
 		a = &pqAskState{}
 		mgr.pqAsk[pub] = a
 	}
-	if a.waiting {
+	if a.waiting || a.exhausted {
 		return
 	}
 	if a.tries >= pqAskTries {
-		delete(mgr.pqAsk, pub)
-		mgr._upgradeLater(pub)
+		a.exhausted = true
 		return
 	}
 	a.waiting = true
@@ -339,11 +342,13 @@ func (mgr *sessionManager) _askPQInfoAgain(pub edPub) {
 			a.tries++
 			info := mgr.sessions[pub]
 			if info == nil || info.pq || mgr.pqPending[pub] != nil || mgr.pc.pq.usableKey(&pub) != nil {
-				delete(mgr.pqAsk, pub)
+				if mgr.pqAsk[pub] == a {
+					delete(mgr.pqAsk, pub) // ours only: a newer entry of a session since has its own timer (round 9)
+				}
 				return
 			}
 			mgr._maybeStartPQ(&pub) // our PQInfo again (its interval passed), and the next ask
-			if !a.waiting && mgr.pqAsk[pub] == a {
+			if !a.waiting && !a.exhausted && mgr.pqAsk[pub] == a {
 				// _maybeStartPQ asked nothing again (no token for our PQInfo, no room, PQ off or in answer only
 				// now): the entry goes, or it would stay for good (round 8d)
 				delete(mgr.pqAsk, pub)

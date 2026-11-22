@@ -598,8 +598,7 @@ func (info *sessionInfo) _fixShared(recvNonce, sendNonce uint64) {
 	info.nextSendNonce, info.nextRecvNonce = 0, 0
 	if recvNonce != 0 {
 		// a ratchet step: the new receive key was the next key, taken up to recvNonce under a strict mark
-		// (arngory/ironwood#2, review R5-1)
-		info.recvWindow.through(recvNonce)
+		info.recvWindow.resetAt(recvNonce)
 	} else {
 		info.recvWindow.reset()
 	}
@@ -733,7 +732,8 @@ func (info *sessionInfo) _replay() sessionReplay {
 // _carryReplay: after an init or ack of the peer's (_handleUpdate), each receive key that was one before keeps its
 // replay state, or a packet seen under it would open again: an update that keeps the peer's keys moves ours on, and
 // the send keys become receive ones, under which the peer's packets had a high-water mark of their nonces (classic
-// and PQ alike; a key not seen before starts afresh)
+// and PQ alike; a key not seen before starts afresh). Upstream starts every key afresh here: a re-init of the peer's
+// with its current keys opened again what it had sent under its next key (review R4-5)
 func (info *sessionInfo) _carryReplay(old *sessionReplay) {
 	seen := func(k *boxShared) (uint64, bool) {
 		switch *k {
@@ -749,7 +749,7 @@ func (info *sessionInfo) _carryReplay(old *sessionReplay) {
 	if info.recvShared == old.recv {
 		info.recvWindow = old.window
 	} else if n, ok := seen(&info.recvShared); ok {
-		info.recvWindow.through(n)
+		info.recvWindow.resetAt(n)
 	}
 	if n, ok := seen(&info.nextSendShared); ok {
 		info.nextSendNonce = n

@@ -3,6 +3,7 @@ package encrypted
 import (
 	"math/rand"
 	"testing"
+	"time"
 )
 
 // reference model: a set of seen nonces plus a high-water mark,
@@ -171,32 +172,74 @@ func TestReplayWindowAgainstModel(t *testing.T) {
 	}
 }
 
-// through: every nonce up to n seen, the ones after it not; the window moves on from there as from a commit
-func TestReplayThrough(t *testing.T) {
+// TestReplayResetAtThrough: resetAt as a ratchet step uses it, every nonce up to n seen and the ones after it not;
+// the window moves on from there as from a commit
+func TestReplayResetAtThrough(t *testing.T) {
 	for _, n := range []uint64{1, 63, 64, 100, 127, 128, 9000} {
 		var w replayWindow
 		w.reset()
-		w.through(n)
+		w.resetAt(n)
 		for _, seen := range []uint64{0, 1, n / 2, n - 1, n} {
 			if seen <= n && w.check(seen) {
-				t.Fatalf("through(%d): %d not seen", n, seen)
+				t.Fatalf("resetAt(%d): %d not seen", n, seen)
 			}
 		}
 		for _, next := range []uint64{n + 1, n + 2, n + 64, n + 1000} {
 			if !w.check(next) {
-				t.Fatalf("through(%d): %d seen", n, next)
+				t.Fatalf("resetAt(%d): %d seen", n, next)
 			}
 		}
 		w.commit(n + 2)
 		if !w.check(n+1) || w.check(n+2) || w.check(n) {
-			t.Fatalf("through(%d), then %d committed: %d %v, %d %v, %d %v", n, n+2, n+1, w.check(n+1), n+2, w.check(n+2), n, w.check(n))
+			t.Fatalf("resetAt(%d), then %d committed: %d %v, %d %v, %d %v", n, n+2, n+1, w.check(n+1), n+2, w.check(n+2), n, w.check(n))
 		}
 	}
 }
 
-// TestRatchetStepKeepsMark (R5-1): a ratchet step (_fixShared with the next key's mark) leaves every nonce up to it
-// refused under the new receive key: packets taken under it while it was the next key do not open again. The window
-// kept only the step's own nonce, and the rest of the minute before the step opened twice
+// TestReplayWindowResetAt: after resetAt(floor) every nonce up to floor is taken for seen, as under a strict mark, and
+// every nonce above it is taken once, in any order.
+func TestReplayWindowResetAt(t *testing.T) {
+	rng := rand.New(rand.NewSource(3))
+	for _, floor := range []uint64{1, 62, 63, 64, 65, 127, 128, 1000, replayWindowDepth + 7, 1<<20 + 5} {
+		var w replayWindow
+		w.reset()
+		for n := uint64(1); n < 50; n++ {
+			w.commit(n) // some state before, as a session has
+		}
+		w.resetAt(floor)
+		low := uint64(0)
+		if floor > replayWindowDepth+5 {
+			low = floor - replayWindowDepth - 5
+		}
+		for n := low; n <= floor; n++ {
+			if w.check(n) {
+				t.Fatalf("floor %d: nonce %d at or below it taken", floor, n)
+			}
+		}
+		perm := rng.Perm(300)
+		for _, i := range perm {
+			n := floor + 1 + uint64(i)
+			if !w.check(n) {
+				t.Fatalf("floor %d: nonce %d above it rejected", floor, n)
+			}
+			w.commit(n)
+		}
+		for _, i := range perm {
+			if n := floor + 1 + uint64(i); w.check(n) {
+				t.Fatalf("floor %d: nonce %d taken twice", floor, n)
+			}
+		}
+		for n := low; n <= floor; n++ {
+			if w.check(n) {
+				t.Fatalf("floor %d: nonce %d at or below it taken after the window moved", floor, n)
+			}
+		}
+	}
+}
+
+// TestRatchetStepKeepsMark: a ratchet step (_fixShared with the next key's mark) leaves every nonce up to it refused
+// under the new receive key: packets taken under it while it was the next key do not open again. The window from
+// 6599008 kept only the step's own nonce, and the rest of the minute before the step opened twice.
 func TestRatchetStepKeepsMark(t *testing.T) {
 	var ed edPub
 	cur, _ := newBoxKeys()
@@ -217,5 +260,29 @@ func TestRatchetStepKeepsMark(t *testing.T) {
 	info._fixShared(0, 0) // a new session (init, ack): a fresh window
 	if info.recvWindow.check(0) || !info.recvWindow.check(1) {
 		t.Fatal("a fresh window after a new session is not fresh")
+	}
+}
+
+// TestReinitKeepsReplay (R4-5): a peer's init that makes our next-send key the receive key keeps the mark of the
+// packets taken under it. Upstream started it afresh: a re-init of the peer's with its current keys opened again what
+// it had sent under them
+func TestReinitKeepsReplay(t *testing.T) {
+	var ed edPub
+	cur, _ := newBoxKeys()
+	next, _ := newBoxKeys()
+	info := newSession(&ed, cur, next, 1)
+	info.mgr = &sessionManager{idleTimeout: time.Hour} // the update resets the session's timer (pq-sessions)
+	defer func() { info.timer.Stop() }()
+	info.nextSendNonce = 37 // the peer's packets taken under the next key
+	newNext, _ := newBoxKeys()
+	init := newSessionInit(&next, &newNext, 2)
+	info._handleUpdate(&init, nil, true) // a peer's init, as handleInit takes it
+	for n := uint64(0); n <= 37; n++ {
+		if info.recvWindow.check(n) {
+			t.Fatalf("nonce %d, taken under the next key before the init, open again", n)
+		}
+	}
+	if !info.recvWindow.check(38) {
+		t.Fatal("a nonce after the mark rejected")
 	}
 }

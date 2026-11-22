@@ -162,6 +162,7 @@ func TestPQAnswerOnlyNoNewHold(t *testing.T) {
 func TestPQAnswerOnlyOldHoldNotMoved(t *testing.T) {
 	t.Parallel()
 	a, b := newPQNode(t, pqOn), newPQNode(t, pqOn)
+	clock := testClock(a.pc) // before the link, while nothing reads it
 	linkPQ(t, a, b)
 	if !hears(a, b, "hello", 3*time.Second) || !hears(b, a, "hello back", 3*time.Second) {
 		t.Fatal("no session")
@@ -172,7 +173,6 @@ func TestPQAnswerOnlyOldHoldNotMoved(t *testing.T) {
 	if stickyFor(a.pc, bKey) == nil {
 		t.Fatal("setup: a does not hold b")
 	}
-	clock := testClock(a.pc)
 	a.pc.SetPQ(pqAnswer)
 	before := stickyFor(a.pc, bKey).until
 	clock.Store(int64(time.Hour)) // an hour on: a hold moved on would move by it

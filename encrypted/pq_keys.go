@@ -68,8 +68,8 @@ var (
 	pqKeyValidity     = 48 * time.Hour // its notAfter: its number (the time it was made) and this
 	pqClockSlack      = 72 * time.Hour // a PQInfo is taken this long after its notAfter (clocks of phones are off)
 	pqInfoInterval    = 3 * time.Second
-	pqInfoAnswerEvery = 30 * time.Second // our PQInfo in answer to a PQInfo, at most pqInfoAnswerBurst per key in this (P-2)
-	pqInfoAnswerBurst = 3                // a lost answer does not hold the next one for pqInfoAnswerEvery (round 8b)
+	pqInfoAnswerEvery = 30 * time.Second // our PQInfo in answer to a PQInfo, at most once per key in this (P-2)
+	pqInfoAnswerBurst = 3                // in answer only, so many in pqInfoAnswerEvery: a lost answer holds no session classic (round 8b)
 	pqAskTries        = 3                // our PQInfo again, after pqInfoInterval, then twice and four times it (round 8b)
 	initReplyInterval = 3 * time.Second  // an init in reply to traffic, at most once in this per key
 	pqInitRetry       = 2 * time.Second
@@ -687,19 +687,25 @@ func (s *pqState) takeRollback(ed *edPub) *pqPeerKey {
 	return k
 }
 
-// answerDue: a PQInfo of ed's may be answered with ours (at most pqInfoAnswerBurst in pqInfoAnswerEvery); counts it.
-// With a one-way delay of half pqInfoInterval or more, each end's answer would come after the other's limit ran out,
-// and the two would answer each other for good (P-2): the burst bounds that to a few in pqInfoAnswerEvery. More than
-// one, as a peer that lost our first answer (one packet held on the way while a path is found) asks again, and a node
-// in answer only, which starts nothing itself, would leave it classic for pqInfoAnswerEvery (round 8b).
+// answerDue: a PQInfo of ed's may be answered with ours (at most once in pqInfoAnswerEvery, pqInfoAnswerBurst times
+// in answer only); counts it. With a one-way delay of half pqInfoInterval or more, each end's answer would come after
+// the other's limit ran out, and the two would answer each other for good (P-2). In answer only more than one: such a
+// node starts nothing itself, and a peer that lost its first answer (one packet held on the way while a path is
+// found) asks again (round 8b); with one answer in 30 s the session stayed classic. A peer with PQ on still answers
+// once in 30 s, so a ping-pong with it stays as bounded as before, and two nodes in answer only, which ask nothing of
+// each other, answer at most a burst each in 30 s.
 func (s *pqState) answerDue(ed *edPub) bool {
+	burst := 1
+	if s.answerOnly() {
+		burst = pqInfoAnswerBurst
+	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	l, now := s._limit(ed), s.now()
 	if l.answeredAt.IsZero() || now.Sub(l.answeredAt) >= pqInfoAnswerEvery {
 		l.answeredAt, l.answered = now, 0
 	}
-	if l.answered >= pqInfoAnswerBurst {
+	if l.answered >= burst {
 		return false
 	}
 	l.answered++

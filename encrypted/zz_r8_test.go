@@ -80,20 +80,26 @@ func TestR8bLostAnswerAsksAgain(t *testing.T) {
 	}
 }
 
-// Round 8b: two ends with PQ on answer each other's PQInfos at most pqInfoAnswerBurst times in pqInfoAnswerEvery: a
-// path slow enough that each answer comes after the other's interval cannot have them answer each other for good.
+// Round 8b: a node with PQ on answers a key's PQInfos once in pqInfoAnswerEvery (a path slow enough that each answer
+// comes after the other's interval cannot have two such ends answer each other for good, P-2); one in answer only, a
+// burst of pqInfoAnswerBurst.
 func TestR8bAnswerBurstBounded(t *testing.T) {
 	t.Parallel()
-	n := newPQNode(t, pqOn)
-	var k edPub
-	k[0] = 1
-	got := 0
-	for i := 0; i < 10; i++ {
-		if n.pc.pq.answerDue(&k) {
-			got++
+	for _, c := range []struct {
+		cfg  PQConfig
+		want int
+	}{{pqOn, 1}, {pqAnswer, pqInfoAnswerBurst}} {
+		n := newPQNode(t, c.cfg)
+		var k edPub
+		k[0] = 1
+		got := 0
+		for i := 0; i < 10; i++ {
+			if n.pc.pq.answerDue(&k) {
+				got++
+			}
 		}
-	}
-	if got != pqInfoAnswerBurst {
-		t.Fatalf("%d answers in a row, want %d", got, pqInfoAnswerBurst)
+		if got != c.want {
+			t.Errorf("answer only %v: %d answers in a row, want %d", c.cfg.AnswerOnly, got, c.want)
+		}
 	}
 }

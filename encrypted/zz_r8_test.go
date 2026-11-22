@@ -1,6 +1,7 @@
 package encrypted
 
 import (
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -42,5 +43,57 @@ func TestR8BothOnShortAwait(t *testing.T) {
 		if !hears(lo, hi, "pq", 3*time.Second) || !hears(hi, lo, "pq back", 3*time.Second) {
 			t.Fatal("no traffic on the PQ session")
 		}
+	}
+}
+
+// Round 8b: the answer-only node's first PQInfo lost on the way (one packet held for the client while a path is
+// found): the client, with a classic session and no key of the node's, asks again, the node answers again, and the
+// session is PQ, whichever end has the lower key.
+func TestR8bLostAnswerAsksAgain(t *testing.T) {
+	t.Parallel()
+	for _, clientLower := range []bool{true, false} {
+		t.Run(map[bool]string{true: "client lower", false: "client higher"}[clientLower], func(t *testing.T) {
+			t.Parallel()
+			lo, hi := lowerFirst(newPQNode(t, pqOn), newPQNode(t, pqOn))
+			client, node := hi, lo
+			if clientLower {
+				client, node = lo, hi
+			}
+			node.pc.SetPQ(pqAnswer)
+			var dropped atomic.Bool
+			drop := func(data []byte) bool {
+				return data[0] == sessionTypePQInfo && dropped.CompareAndSwap(false, true)
+			}
+			node.tap.Store(&drop)
+			linkPQ(t, client, node)
+			if !hears(client, node, "hello", 3*time.Second) || !hears(node, client, "hello back", 3*time.Second) {
+				t.Fatal("no session")
+			}
+			waitSessions(t, client, node, "pq", 15*time.Second)
+			if !dropped.Load() {
+				t.Fatal("the node's PQInfo was not dropped: the test tests nothing")
+			}
+			if n := node.sent[sessionTypePQInit].Load(); n != 0 {
+				t.Errorf("the answer-only node sent %d PQ inits", n)
+			}
+		})
+	}
+}
+
+// Round 8b: two ends with PQ on answer each other's PQInfos at most pqInfoAnswerBurst times in pqInfoAnswerEvery: a
+// path slow enough that each answer comes after the other's interval cannot have them answer each other for good.
+func TestR8bAnswerBurstBounded(t *testing.T) {
+	t.Parallel()
+	n := newPQNode(t, pqOn)
+	var k edPub
+	k[0] = 1
+	got := 0
+	for i := 0; i < 10; i++ {
+		if n.pc.pq.answerDue(&k) {
+			got++
+		}
+	}
+	if got != pqInfoAnswerBurst {
+		t.Fatalf("%d answers in a row, want %d", got, pqInfoAnswerBurst)
 	}
 }

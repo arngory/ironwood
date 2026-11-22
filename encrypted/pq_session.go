@@ -245,6 +245,8 @@ func (mgr *sessionManager) _maybeStartPQ(pub *edPub) {
 		}
 		if mgr._sendPQInfoDue(pub, ask) && info != nil {
 			mgr._upgradeLater(*pub) // no token for our PQInfo now: the upgrade tried again later, not dropped
+		} else if key == nil && info != nil {
+			mgr._askPQInfoAgain(*pub) // its answer may be lost: asked again, a few times (round 8b)
 		}
 		if key != nil && info != nil {
 			mgr._awaitPQInit(*pub)
@@ -286,6 +288,47 @@ func (mgr *sessionManager) _awaitPQInit(pub edPub) {
 					}
 				})
 			})
+		})
+	})
+}
+
+// pqAskState: our PQInfos again to a peer with a classic session whose ML-KEM key we lack (_askPQInfoAgain)
+type pqAskState struct {
+	tries   int  // sent again so far
+	waiting bool // one is due
+}
+
+// _askPQInfoAgain: a classic session up, PQ wanted, and the peer's ML-KEM key not known here: our PQInfo goes again
+// after pqInfoInterval, then twice and four times that, pqAskTries in all, until its key comes (its PQInfo answers
+// ours) or a PQ session is up; then the upgrade is tried again after upgradeRetry. The peer's answer may be lost:
+// while a node finds the path to us one packet is held for us, and its PQInfo can give way to the packet of the
+// classic session that went with it. Before round 8b nothing asked again, and a peer in answer only, which starts
+// nothing, left the session classic.
+func (mgr *sessionManager) _askPQInfoAgain(pub edPub) {
+	a := mgr.pqAsk[pub]
+	if a == nil {
+		a = &pqAskState{}
+		mgr.pqAsk[pub] = a
+	}
+	if a.waiting {
+		return
+	}
+	if a.tries >= pqAskTries {
+		delete(mgr.pqAsk, pub)
+		mgr._upgradeLater(pub)
+		return
+	}
+	a.waiting = true
+	time.AfterFunc(pqInfoInterval<<a.tries, func() {
+		mgr.Act(nil, func() {
+			a.waiting = false
+			a.tries++
+			info := mgr.sessions[pub]
+			if info == nil || info.pq || mgr.pqPending[pub] != nil || mgr.pc.pq.usableKey(&pub) != nil {
+				delete(mgr.pqAsk, pub)
+				return
+			}
+			mgr._maybeStartPQ(&pub) // our PQInfo again (its interval passed), and the next ask
 		})
 	})
 }

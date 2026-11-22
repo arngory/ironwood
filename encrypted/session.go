@@ -43,6 +43,7 @@ type sessionManager struct {
 	pqPending      map[edPub]*pqPending
 	pqRetry        map[edPub]bool         // an upgrade to PQ to try again (_upgradeLater)
 	pqAwait        map[edPub]bool         // a PQ init of the peer's awaited (_awaitPQInit)
+	pqAsk          map[edPub]*pqAskState  // our PQInfo asked again of a peer whose key we lack (_askPQInfoAgain)
 	pqUnconfirmed  map[edPub]*sessionInfo // PQ sessions no traffic may have opened under yet (_countUnconfirmed)
 	pqCount        atomic.Int64           // the PQ sessions in sessions (_put); read by PQSessionCount
 	unconfirmedMax int                    // pqUnconfirmedMax, a test's own
@@ -57,6 +58,7 @@ func (mgr *sessionManager) init(pc *PacketConn) {
 	mgr.pqPending = make(map[edPub]*pqPending)
 	mgr.pqRetry = make(map[edPub]bool)
 	mgr.pqAwait = make(map[edPub]bool)
+	mgr.pqAsk = make(map[edPub]*pqAskState)
 	mgr.pqUnconfirmed = make(map[edPub]*sessionInfo)
 	mgr.unconfirmedMax = pqUnconfirmedMax
 	mgr.idleTimeout = sessionTimeout

@@ -68,7 +68,9 @@ var (
 	pqKeyValidity     = 48 * time.Hour // its notAfter: its number (the time it was made) and this
 	pqClockSlack      = 72 * time.Hour // a PQInfo is taken this long after its notAfter (clocks of phones are off)
 	pqInfoInterval    = 3 * time.Second
-	pqInfoAnswerEvery = 30 * time.Second // our PQInfo in answer to a PQInfo, at most once per key (P-2)
+	pqInfoAnswerEvery = 30 * time.Second // our PQInfo in answer to a PQInfo, at most pqInfoAnswerBurst per key in this (P-2)
+	pqInfoAnswerBurst = 3                // a lost answer does not hold the next one for pqInfoAnswerEvery (round 8b)
+	pqAskTries        = 3                // our PQInfo again, after pqInfoInterval, then twice and four times it (round 8b)
 	initReplyInterval = 3 * time.Second  // an init in reply to traffic, at most once in this per key
 	pqInitRetry       = 2 * time.Second
 	pqAwaitStart      = 3 * pqInitRetry // the higher key's wait for the lower's PQ init before it sends its own
@@ -164,7 +166,8 @@ type pqLimit struct {
 	ed          edPub
 	sentInfoAt  time.Time // our PQInfo to it, last
 	initReplyAt time.Time // our init in reply to its traffic, last
-	answeredAt  time.Time // our PQInfo in answer to a PQInfo of its, last
+	answeredAt  time.Time // the start of the window of our answers to its PQInfos (answerDue)
+	answered    int       // our answers in that window
 }
 
 func (s *pqState) init() {
@@ -684,17 +687,22 @@ func (s *pqState) takeRollback(ed *edPub) *pqPeerKey {
 	return k
 }
 
-// answerDue: a PQInfo of ed's may be answered with ours (at most once in pqInfoAnswerEvery); counts it. With a
-// one-way delay of half pqInfoInterval or more, each end's answer would come after the other's limit ran out, and the
-// two would answer each other for good (P-2)
+// answerDue: a PQInfo of ed's may be answered with ours (at most pqInfoAnswerBurst in pqInfoAnswerEvery); counts it.
+// With a one-way delay of half pqInfoInterval or more, each end's answer would come after the other's limit ran out,
+// and the two would answer each other for good (P-2): the burst bounds that to a few in pqInfoAnswerEvery. More than
+// one, as a peer that lost our first answer (one packet held on the way while a path is found) asks again, and a node
+// in answer only, which starts nothing itself, would leave it classic for pqInfoAnswerEvery (round 8b).
 func (s *pqState) answerDue(ed *edPub) bool {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	l, now := s._limit(ed), s.now()
-	if !l.answeredAt.IsZero() && now.Sub(l.answeredAt) < pqInfoAnswerEvery {
+	if l.answeredAt.IsZero() || now.Sub(l.answeredAt) >= pqInfoAnswerEvery {
+		l.answeredAt, l.answered = now, 0
+	}
+	if l.answered >= pqInfoAnswerBurst {
 		return false
 	}
-	l.answeredAt = now
+	l.answered++
 	return true
 }
 

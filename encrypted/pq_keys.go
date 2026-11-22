@@ -67,7 +67,8 @@ var (
 	pqKeyValidity     = 48 * time.Hour // its notAfter: its number (the time it was made) and this
 	pqClockSlack      = 72 * time.Hour // a PQInfo is taken this long after its notAfter (clocks of phones are off)
 	pqInfoInterval    = 3 * time.Second
-	initReplyInterval = 3 * time.Second // an init in reply to traffic, at most once in this per key
+	pqInfoAnswerEvery = 30 * time.Second // our PQInfo in answer to a PQInfo, at most once per key (P-2)
+	initReplyInterval = 3 * time.Second  // an init in reply to traffic, at most once in this per key
 	pqInitRetry       = 2 * time.Second
 	pqRollbackTries   = 3
 	pqRollbackAfter   = 30 * time.Second
@@ -145,6 +146,7 @@ const (
 	askOwn      pqAsk = iota // our own traffic waits for a session: no token
 	askSigned                // a signed packet of the key's: the known bucket's token for a key in peers, the signed bucket's else
 	askUnsigned              // a packet no one signed, claimed from the key: a token of the bucket its entry says
+	askSealed                // a PQ init or ack sealed to an ML-KEM key of ours not taken: twice our answer, no token
 )
 
 const pqLogQueue = 64
@@ -159,6 +161,7 @@ type pqLimit struct {
 	ed          edPub
 	sentInfoAt  time.Time // our PQInfo to it, last
 	initReplyAt time.Time // our init in reply to its traffic, last
+	answeredAt  time.Time // our PQInfo in answer to a PQInfo of its, last
 }
 
 func (s *pqState) init() {
@@ -671,6 +674,20 @@ func (s *pqState) takeRollback(ed *edPub) *pqPeerKey {
 	s.logf("PQ: %x answers no PQ init under its ML-KEM key number %d; its key number %d, a lower one, taken (a restart with a clock behind?)",
 		ed[:8], old.seq, k.seq)
 	return k
+}
+
+// answerDue: a PQInfo of ed's may be answered with ours (at most once in pqInfoAnswerEvery); counts it. With a
+// one-way delay of half pqInfoInterval or more, each end's answer would come after the other's limit ran out, and the
+// two would answer each other for good (P-2)
+func (s *pqState) answerDue(ed *edPub) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	l, now := s._limit(ed), s.now()
+	if !l.answeredAt.IsZero() && now.Sub(l.answeredAt) < pqInfoAnswerEvery {
+		return false
+	}
+	l.answeredAt = now
+	return true
 }
 
 // infoDue: our PQInfo may go to ed now, at most once in pqInfoInterval, and with a token where ask says (pqAsk: in

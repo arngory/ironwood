@@ -177,7 +177,10 @@ func (mgr *sessionManager) _handlePQInfo(pub *edPub, data []byte) {
 	}
 	accepted, _ := mgr.pc.pq.accept(pub, &pq.pub, pq.seq, pq.notAfter)
 	// an answer, so that the sender knows our key too (it may have lost it): limited, or two nodes would ping-pong
-	mgr._sendPQInfoDue(pub, askSigned)
+	// (pqInfoInterval, and pqInfoAnswerEvery for these answers: a slow path ping-pongs past the first, P-2)
+	if mgr.pc.pq.answerDue(pub) {
+		mgr._sendPQInfoDue(pub, askSigned)
+	}
 	if !accepted {
 		return
 	}
@@ -205,9 +208,14 @@ func (mgr *sessionManager) _maybeStartPQ(pub *edPub) {
 		return
 	}
 	_, buffered := mgr.buffers[*pub]
+	info := mgr.sessions[*pub]
 	if p := mgr.pqPending[*pub]; p != nil {
-		if p.once && buffered {
-			// one sent in reply to a packet no one signed, and data of ours waits for it now: sent again until its ack
+		if p.once && (buffered || (info != nil && !info.pq && mgr.pc.pq.initiates(pub))) {
+			// one sent in reply to a packet no one signed, and a trigger of ours wants one now (data of ours waits
+			// for it, or a classic session to replace: a signed handshake, our retry; not in answer only): sent again
+			// until its ack, and its expiry schedules the retry, as for one we started. Left once, it would swallow
+			// the trigger, and its expiry schedules nothing (R6A-2). A packet no one signed alone still starts no
+			// retries (R3-4)
 			p.once = false
 			mgr._sendPending(pub, p)
 		}
@@ -216,7 +224,6 @@ func (mgr *sessionManager) _maybeStartPQ(pub *edPub) {
 	if !mgr.pc.pq.initiates(pub) {
 		return // answer only: neither our PQ init nor our PQInfo, which would have the peer start one
 	}
-	info := mgr.sessions[*pub]
 	if info != nil && info.pq {
 		return
 	}
@@ -224,6 +231,9 @@ func (mgr *sessionManager) _maybeStartPQ(pub *edPub) {
 		return
 	}
 	if mgr._pqStartFull(pub) {
+		if info != nil {
+			mgr._upgradeLater(*pub) // tried again later, once the table may have room (R6A-1: else classic for good)
+		}
 		return // nor our PQInfo, which would have the peer start one
 	}
 	key := mgr.pc.pq.usableKey(pub)
@@ -436,7 +446,10 @@ func (mgr *sessionManager) _handlePQInit(pub *edPub, data []byte, isAck bool) {
 	var init pqInit
 	ok, unknownKey := init.decrypt(mgr.pc, pub, data)
 	if unknownKey {
-		mgr._replyPQInfo(pub) // nothing checked it: sealed to a key not ours
+		// nothing checked it: sealed to a key not ours (or ours before a restart). Our PQInfo is half its size: no
+		// token, as for our own asks, only pqInfoInterval. A flood of small forged packets empties the buckets, and
+		// a peer that holds us to PQ would not learn our new key while it lasts (R6A-3)
+		mgr._sendPQInfoDue(pub, askSealed)
 	}
 	if !ok {
 		return
@@ -471,6 +484,12 @@ func (mgr *sessionManager) _handlePQInit(pub *edPub, data []byte, isAck bool) {
 	if info := mgr.sessions[*pub]; info != nil && info.pq {
 		isOld = true
 	}
+	// an ack to a PQ init of ours that went on its own (not one sent once in reply to a packet no one signed, which
+	// anyone can have us make, R6A-5)
+	answersOurs := false
+	if p := mgr.pqPending[*pub]; isAck && p != nil && !p.once {
+		answersOurs = true
+	}
 	info := mgr._pqSessionForInit(pub, &init, isAck)
 	if info == nil {
 		return // the hard limit, every PQ session in use: classic, if the key may be
@@ -489,10 +508,12 @@ func (mgr *sessionManager) _handlePQInit(pub *edPub, data []byte, isAck bool) {
 		// ours drops, until our probe in reply to it (initReplyInterval)
 		info.doSend(mgr, allocBytes(0))
 	}
-	if isAck && info.fallback == nil {
+	if isAck && info.fallback == nil && fresh && (isOld || answersOurs) {
 		// a verified ack, no classic session beside: the other end has the session, and the key is held to PQ. With
 		// a classic one beside, only a PQ packet of the peer's that opens does it (doRecv): until then the peer may
-		// not have the session (our ack to its ack lost), and goes on with the classic one
+		// not have the session (our ack to its ack lost), and goes on with the classic one. Only an ack newer than the
+		// session's last, or one to an init of ours: an ack is not bound to the init it answers, and one replayed
+		// (captured on the way) renews no hold (R6A-5, as R3-1 for traffic); else the first PQ packet that opens does
 		mgr.pc.pq.markSticky(pub, init.senderNotAfter, false)
 	}
 	if buf := mgr.buffers[*pub]; buf != nil {
@@ -632,11 +653,16 @@ func (mgr *sessionManager) _probe(info *sessionInfo) {
 
 // _upgradeLater: a PQ init to pub again after pqUpgradeRetry, if the session is still classic then
 func (mgr *sessionManager) _upgradeLater(pub edPub) {
+	mgr._upgradeAfter(pub, mgr.pc.pq.upgradeRetry)
+}
+
+// _upgradeAfter: as _upgradeLater, after d
+func (mgr *sessionManager) _upgradeAfter(pub edPub, d time.Duration) {
 	if mgr.pqRetry[pub] {
 		return
 	}
 	mgr.pqRetry[pub] = true
-	time.AfterFunc(mgr.pc.pq.upgradeRetry, func() {
+	time.AfterFunc(d, func() {
 		mgr.Act(nil, func() {
 			delete(mgr.pqRetry, pub)
 			if info := mgr.sessions[pub]; info != nil && !info.pq {

@@ -719,8 +719,8 @@ func TestPQKnownAskBucketEmpty(t *testing.T) {
 	}
 }
 
-// R4-6 (Q28): our PQInfo in reply to a PQ init sealed to a key not ours (nothing checked it) takes a token, of the
-// known bucket for a key known here.
+// R4-6 (Q28), reversed by R6A-3: our PQInfo in reply to a PQ init sealed to a key not ours (nothing checked it) takes
+// no token (it is half the size of the ask), only the key's pqInfoInterval.
 func TestPQUnknownKeyInfoToken(t *testing.T) {
 	n := newPQNode(t, pqOn) // no link
 	p := lightPC(t)
@@ -736,11 +736,16 @@ func TestPQUnknownKeyInfoToken(t *testing.T) {
 	n.pc.pq.knownBucket = pqBucket{at: time.Now().Add(time.Hour)}
 	n.pc.pq.limits = make(map[edPub]*list.Element)
 	n.pc.pq.limitsLRU.Init()
+	n.pc.pq.unknownBucket = pqBucket{at: time.Now().Add(time.Hour)}
 	n.pc.pq.mu.Unlock()
 	before := n.sent[sessionTypePQInfo].Load()
+	deliverTo(n, k, append(allocBytes(0), data...))
+	if got := n.sent[sessionTypePQInfo].Load() - before; got != 1 {
+		t.Fatalf("%d PQInfos with the buckets empty for a PQ init sealed to a key not ours, want 1", got)
+	}
 	deliverTo(n, k, data)
-	if got := n.sent[sessionTypePQInfo].Load() - before; got != 0 {
-		t.Fatalf("%d PQInfos with the bucket empty for a PQ init sealed to a key not ours", got)
+	if got := n.sent[sessionTypePQInfo].Load() - before; got != 1 {
+		t.Fatalf("%d PQInfos within pqInfoInterval, want 1", got)
 	}
 }
 

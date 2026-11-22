@@ -135,10 +135,16 @@ func (mgr *sessionManager) _openedWithin(info *sessionInfo, d time.Duration) boo
 // upgradeClassic: each classic session up is upgraded later (_upgradeLater), PQ back from answer only
 func (mgr *sessionManager) upgradeClassic() {
 	mgr.Act(nil, func() {
+		var keys []edPub
 		for k, info := range mgr.sessions {
 			if !info.pq {
-				mgr._upgradeLater(k)
+				keys = append(keys, k)
 			}
+		}
+		// spread over pqUpgradeRetry: all at once, thousands of PQ inits would be sealed in this actor in one go
+		// (some 0.32 ms each) and sent in a burst (2.5 KB each)
+		for i, k := range keys {
+			mgr._upgradeAfter(k, mgr.pc.pq.upgradeRetry*time.Duration(i+1)/time.Duration(len(keys)))
 		}
 	})
 }

@@ -1,9 +1,12 @@
 package encrypted
 
 import (
+	"fmt"
 	"sync/atomic"
 	"testing"
 	"time"
+
+	"github.com/Arceliar/ironwood/types"
 )
 
 // Round 8 (neko): a node in answer only with the lower key and a client with PQ on, the classic session up before
@@ -102,4 +105,68 @@ func TestR8bAnswerBurstBounded(t *testing.T) {
 			t.Errorf("answer only %v: %d answers in a row, want %d", c.cfg.AnswerOnly, got, c.want)
 		}
 	}
+}
+
+// Round 8c: the PQ session confirmed at y, not yet at x (y's PQ packets held on the way): x sends by the classic
+// session still, and y takes that traffic for pqStaleGrace instead of dropping it. Before, a window of data in
+// flight at the switch was lost, and a TCP flow over it stalled on its backoff.
+func TestR8cClassicTakenAtTheSwitch(t *testing.T) {
+	t.Parallel()
+	var x, y *pqNode
+	var hold atomic.Bool
+	// a classic session first, then the PQ one: where the first packet waited for a session, the PQ one comes up
+	// directly with no classic one beside, and the test is set up again
+	for try := 0; ; try++ {
+		if try == 8 {
+			t.Fatal("no classic session first in 8 tries")
+		}
+		x, y = newPQNode(t, pqOn), newPQNode(t, pqOn)
+		hold.Store(true)
+		dropPQ := func(data []byte) bool { return hold.Load() && data[0] == sessionTypePQTraffic }
+		y.tap.Store(&dropPQ)
+		linkPQ(t, x, y)
+		if !hears(x, y, "hello", 3*time.Second) {
+			continue
+		}
+		ok := false
+		for deadline := time.Now().Add(6 * time.Second); time.Now().Before(deadline); time.Sleep(20 * time.Millisecond) {
+			if session(y, x) == "pq" && session(x, y) == "pq, unconfirmed" {
+				ok = true
+				break
+			}
+			x.pc.WriteTo([]byte("keep"), types.Addr(y.pub))
+		}
+		if ok {
+			break
+		}
+	}
+	// drain what came so far
+	for len(y.heard) > 0 {
+		<-y.heard
+	}
+	const n = 100
+	got := make(chan int, 1)
+	go func() {
+		c := 0
+		for deadline := time.After(2 * time.Second); ; {
+			select {
+			case m := <-y.heard:
+				if len(m) > 4 && m[:4] == "seq:" {
+					c++
+				}
+			case <-deadline:
+				got <- c
+				return
+			}
+		}
+	}()
+	for i := 0; i < n; i++ {
+		x.pc.WriteTo([]byte(fmt.Sprintf("seq:%03d", i)), types.Addr(y.pub))
+		time.Sleep(2 * time.Millisecond)
+	}
+	if c := <-got; c != n {
+		t.Fatalf("y took %d of %d packets x sent by the classic session at the switch", c, n)
+	}
+	hold.Store(false)
+	waitSessions(t, x, y, "pq", 10*time.Second)
 }

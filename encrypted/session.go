@@ -112,6 +112,16 @@ func (mgr *sessionManager) _evict(info *sessionInfo) (then string) {
 	return "it goes"
 }
 
+// _fallbackGrace: info, a PQ session, was confirmed here less than pqStaleGrace ago: the classic session beside it
+// still takes the peer's traffic (round 8c). A key that must be PQ by the config has no classic session beside.
+func (mgr *sessionManager) _fallbackGrace(info *sessionInfo) bool {
+	if !info.confirmed.Load() {
+		return false
+	}
+	at := info.confirmedAt.Load()
+	return at != 0 && mgr.pc.pq.now().Sub(time.Unix(0, at)) < pqStaleGrace
+}
+
 // _expire: info's timer fired: nothing received under it in idleTimeout (a PQ session: nothing opened; our own sends
 // keep a classic session up, not a PQ one, or a peer that dropped its PQ session would never be noticed)
 func (mgr *sessionManager) _expire(info *sessionInfo) {
@@ -344,6 +354,17 @@ func (mgr *sessionManager) _handleTraffic(pub *edPub, msg []byte) {
 			// to the classic session beside a PQ one nothing opened under yet: the peer may not have the PQ one
 			info.fallback.doRecv(mgr, msg)
 			return
+		case info.pq && info.fallback != nil && mgr._fallbackGrace(info):
+			// the PQ session confirmed here a moment ago, and the peer sends by the classic one still: it has not
+			// opened a PQ packet of ours yet (a few ms behind, or ours held on the way). Taken for pqStaleGrace, or a
+			// window of its data in flight is lost at the switch, and TCP over it stalls on its backoff (round 8c).
+			// Only by the classic session of this pair, under its keys and replay window: nothing forged opens, and
+			// nothing is downgraded (the hold the confirmation made refuses a new classic session)
+			info.fallback.doRecv(mgr, msg)
+			if mgr.pc.pq.initReplyDue(pub) {
+				info.doSend(mgr, allocBytes(0)) // a PQ packet, to confirm the peer's session sooner
+			}
+			return
 		case info.pq:
 			if info.fallback != nil && required {
 				// a key that must be PQ now (Required, or held to PQ): the classic session beside goes, not restored
@@ -426,7 +447,11 @@ func (mgr *sessionManager) writeTo(toKey edPub, msg []byte) {
 		}
 		if info != nil && info.pq && info.fallback != nil {
 			if info.confirmed.Load() || mgr.pc.pq.required(&toKey) {
-				info.fallback = nil
+				// our traffic by the PQ session now; the classic one kept for the peer's, for pqStaleGrace after
+				// the confirmation (_fallbackGrace), then dropped
+				if !mgr._fallbackGrace(info) {
+					info.fallback = nil
+				}
 			} else {
 				// nothing opened under the PQ session yet: traffic by the classic one, and a probe now and then
 				info.fallback.doSend(mgr, msg)
@@ -549,6 +574,7 @@ type sessionInfo struct {
 	sentAt       time.Time    // a PQ packet of ours sent under it, last
 	seqCurrents  []boxPub     // R5-2: the peer's current keys of each init or ack taken at seq
 	confirmed    atomic.Bool  // a PQ packet opened (read by the manager)
+	confirmedAt  atomic.Int64 // then, first (pq.now, Unix nanoseconds; read by the manager: _fallbackGrace)
 	openedAt     atomic.Int64 // then, last (pq.now, Unix nanoseconds; read by the manager)
 	adBuf        [32]byte     // a PQ packet's header as associated data (Seal: not where the output goes)
 	nonceBuf     [pqNonceSize]byte
@@ -988,6 +1014,7 @@ func (info *sessionInfo) doRecv(from phony.Actor, msg []byte) {
 				}
 				info.openedAt.Store(now.UnixNano())
 				if !info.confirmed.Load() {
+					info.confirmedAt.Store(now.UnixNano()) // before confirmed, which the manager reads first
 					info.confirmed.Store(true)
 				}
 				info.lastOpened = time.Now()

@@ -323,7 +323,16 @@ func (mgr *sessionManager) _handleInit(pub *edPub, init *sessionInit) {
 		if buf != nil && buf.data != nil {
 			info.doSend(mgr, buf.data)
 		}
+		mgr._handshakeAsksAgain(pub)
 		mgr._maybeStartPQ(pub)
+	}
+}
+
+// _handshakeAsksAgain: a handshake of the peer's: a round of asks that went unanswered (pqAskState.exhausted) may
+// start again (round 9)
+func (mgr *sessionManager) _handshakeAsksAgain(pub *edPub) {
+	if a := mgr.pqAsk[*pub]; a != nil && a.exhausted {
+		delete(mgr.pqAsk, *pub)
 	}
 }
 
@@ -338,6 +347,7 @@ func (mgr *sessionManager) _handleAck(pub *edPub, ack *sessionAck) {
 		if buf != nil && buf.data != nil {
 			info.doSend(mgr, buf.data)
 		}
+		mgr._handshakeAsksAgain(pub)
 		mgr._maybeStartPQ(pub)
 	}
 }
